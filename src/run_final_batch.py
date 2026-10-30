@@ -423,8 +423,9 @@ def main():
             final_rows.append(rec)
             print(f"    VERDICT {verd}: {reason}", flush=True)
 
-            score = (oos_st["expectancy_r"] if oos_st["n_trades"] >= 15 else -999,
-                     oos_st["profit_factor"], verd == "KEEP", verd == "MAYBE")
+            # AUDIT fix: pick variant on IS only; OOS is for reporting, not selection
+            score = (is_st["expectancy_r"] if is_st["n_trades"] >= 15 else -999,
+                     is_st["profit_factor"], verd == "KEEP", verd == "MAYBE")
             if best_overall is None or score > best_overall[0]:
                 best_overall = (score, rec, fo, variant, fname, flags, cap)
 

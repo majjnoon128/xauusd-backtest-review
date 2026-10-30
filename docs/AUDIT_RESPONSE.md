@@ -2,6 +2,8 @@
 
 Status: engine correctness fixes landed; focused rebacktest at SL cap $8; watchdog **frozen**.
 
+Primary commit: [`d4b4531`](https://github.com/majjnoon128/xauusd-backtest-review/commit/d4b4531061e8f83f917f4528cccdf6c5b0d0a619) (engine+MC+optimize+NDS+tests+report). Follow-ups may append.
+
 | # | Finding | Agree? | Fix | Test |
 |---|---|---|---|---|
 | 1 | Bid/ask unbalanced | **Agree** | Explicit bid/ask for long/short × entry/exit × mkt/limit/stop; buy-stop on ask; short SL/TP on ask | `tests/test_engine_audit.py` |
