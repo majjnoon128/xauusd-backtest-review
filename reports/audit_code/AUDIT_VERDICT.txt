@@ -1,0 +1,6 @@
+CODE AUDIT VERDICT 2026-10-30
+Bugs fixed: engine stop/limit gap-through; not_extended M15 lookahead; SP2L FVG waiver; MicroMAP H2 TP.
+Prior ProBTB KEEP INVALID: OOS n=92 WR42% PF0.97 MC~59% (was 133/47%/1.32/99%).
+Prior AMD KEEP INVALID: OOS n=19 WR11% PF1.42 (was 22/23%/1.54); n too small / fragile.
+All 6 strategies: DROP under audited fixed engine + $5 SL cap.
+User suspicion confirmed for inflated KEEPs.

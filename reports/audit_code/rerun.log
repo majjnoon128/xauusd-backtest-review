@@ -1,0 +1,38 @@
+LOAD
+GEN NDS...
+  DROP 25 0.3863530645262705
+  DROP 34 0.26595254568360954
+GEN Idris...
+  DROP 5 1.3945959838239466
+  DROP 5 1.0940339232111824
+GEN SP2L (fixed FVG)...
+  DROP 16 0.321690304844949
+  DROP 44 0.7264106738509297
+GEN ProBTB...
+  DROP M5_m1_limit_breakeven_rr2.0 htf+dxy 177 0.8794721078389983 None
+  DROP M5_m1_limit_breakeven_rr2.0 htf+not_ext 180 0.809855963040096 None
+ProBTB forced prior KEEP config...
+ forced 92 0.9746066415469544 0.42391304347826086 0.5913333333333334
+gap recheck...
+  {'fills': 4043, 'gaps': 1647, 'gap_pct': 40.74, 'mean_extra_adverse': 2.9393296903460895}
+GEN MicroMAP...
+  DROP 6 0.0
+  DROP 8 0.0
+GEN AMD...
+  DROP asian_M5_market_rr2 18 0.44984649365907736
+  DROP asian_M5_market_rr2 26 0.4722630311982015
+ forced AMD 19 1.421040796342132 0.10526315789473684
+DONE
+    strategy  cap                     variant         filter  oos_n   oos_wr   oos_pf     oos_r verdict mc_pass_0.5pct
+     NDS_Fib  5.0               062_078_rr1.5        htf+vol     25 0.280000 0.386353 -0.473665    DROP           None
+     NDS_Fib  7.5              0786_086_rr2.0        htf+vol     34 0.176471 0.265953 -0.701216    DROP           None
+       Idris  5.0             h4_rsi_ib_rr3.0            vol      5 0.400000 1.394596 -0.103964    DROP           None
+       Idris  7.5             h4_rsi_ib_rr3.0            vol      5 0.400000 1.094034 -0.103964    DROP           None
+        SP2L  5.0                  M5_A_rr1.5       baseline     16 0.250000 0.321690 -0.369125    DROP           None
+        SP2L  7.5                  M5_A_rr1.0 htf+atr_regime     44 0.431818 0.726411 -0.164391    DROP           None
+      ProBTB  5.0 M5_m1_limit_breakeven_rr2.0        htf+dxy    177 0.276836 0.879472 -0.004191    DROP           None
+      ProBTB  7.5 M5_m1_limit_breakeven_rr2.0    htf+not_ext    180 0.255556 0.809856 -0.086735    DROP           None
+    MicroMAP  5.0                    H1_rr1.5       baseline      6 0.000000 0.000000 -1.200147    DROP           None
+    MicroMAP  7.5                    H1_rr1.5       baseline      8 0.000000 0.000000 -1.182521    DROP           None
+AMD_PO3_iFVG  5.0         asian_M5_market_rr2       baseline     18 0.222222 0.449846 -0.499557    DROP           None
+AMD_PO3_iFVG  7.5         asian_M5_market_rr2       baseline     26 0.230769 0.472263 -0.416031    DROP           None

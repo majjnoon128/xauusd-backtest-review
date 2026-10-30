@@ -1,0 +1,1854 @@
+"""Audited backtest engine — the ONLY fill engine.
+
+Rules:
+- Signals/orders are armed AFTER the signal bar ends (closed-bar).
+- No fill on the signal/arm bar.
+- Bid data + ask-side fills: long limit needs low <= limit - spread;
+  long stop/market pays ask ≈ mid/bid + spread/2 + slip (we use entry + spread + slip for market buys).
+- Intrabar on M1: if SL and TP both reachable → SL first (worst case).
+- HTF/DXY consumers must use last CLOSED bars only (helpers in indicators).
+- Default costs: spread 0.35, slip 0.10, commission 7/lot.
+- Market orders: 1 M1 bar delay after arm time.
+"""
+from __future__ import annotations
+from dataclasses import dataclass, field, asdict
+from typing import List, Optional, Dict, Any, Literal
+import numpy as np
+import pandas as pd
+
+SPREAD = 0.35
+SLIPPAGE = 0.10
+COMMISSION_PER_LOT = 7.0
+MARKET_DELAY_M1 = 1
+
+
+OrderKind = Literal["limit", "stop", "market"]
+
+
+@dataclass
+class Order:
+    """Pending order armed at arm_time (first eligible M1 is AFTER arm_time)."""
+    arm_time: pd.Timestamp          # instant order becomes known (bar end)
+    side: str                       # long | short
+    kind: OrderKind
+    price: float                    # limit/stop price; for market = reference/close
+    sl: float
+    tp: float
+    strategy: str
+    variant: str
+    meta: Dict[str, Any] = field(default_factory=dict)
+    expire_minutes: int = 60        # cancel if unfilled
+    max_hold_minutes: int | None = None  # flat at close after N M1 bars if set
+    min_hold_minutes: int | None = None  # prop: ignore SL/TP until >= N M1 bars after fill
+
+
+@dataclass
+class Trade:
+    strategy: str
+    variant: str
+    side: str
+    kind: str
+    entry_time: pd.Timestamp
+    exit_time: pd.Timestamp
+    entry: float
+    exit: float
+    sl: float
+    tp: float
+    lots: float
+    pnl_usd: float
+    r_multiple: float
+    reason: str
+    duration_s: float
+    same_m1_entry_exit: bool
+    dxy_filter: bool
+    vol_filter: bool
+    day: str
+    month: str
+
+
+def sl_distance_price(entry: float, sl: float, side: str, spread: float = SPREAD) -> float:
+    """Effective adverse distance in $ price, including spread to fill/stop.
+    For sizing: 0.01 lot risks ~$1 per $1 of this distance.
+    """
+    raw = abs(entry - sl)
+    # Long pays ask on entry; SL is bid-side — add half-ish via full spread buffer
+    return raw + spread
+
+
+def _lots_from_risk_usd(risk_usd: float, dist_price: float) -> float:
+    """lot = floor(risk_usd / dist_price) * 0.01. Returns 0 if cannot fit min lot under risk."""
+    if dist_price <= 0 or risk_usd <= 0:
+        return 0.0
+    # Each 0.01 lot risks `dist_price` USD
+    n_minilots = int(risk_usd // dist_price)  # floor
+    return round(n_minilots * 0.01, 2)
+
+
+def _lots_fractional(risk_usd: float, dist_price: float) -> float:
+    """Continuous lot for analysis: exact risk_usd / (dist per 0.01-lot unit).
+    0.01 lot risks `dist_price` USD → lots = (risk_usd / dist_price) * 0.01.
+    """
+    if dist_price <= 0 or risk_usd <= 0:
+        return 0.0
+    return float(risk_usd / dist_price) * 0.01
+
+
+def _lots(balance: float, risk_pct: float, entry: float, sl: float,
+          spread: float = SPREAD, side: str = "long") -> float:
+    dist = sl_distance_price(entry, sl, side, spread)
+    risk_usd = balance * risk_pct
+    return _lots_from_risk_usd(risk_usd, dist)
+
+
+def _fill_price(side: str, kind: OrderKind, order_price: float, bar_open: float,
+                spread: float, slip: float) -> float:
+    """Fill price with gap-through: if bar opens through the order, fill at worse open."""
+    if kind == "limit":
+        # buy limit: fill at min(limit, open) + slip (gap-down through limit → open)
+        if side == "long":
+            px = min(order_price, bar_open)
+            return px + slip
+        # sell limit: fill at max(limit, open) - slip
+        px = max(order_price, bar_open)
+        return px - slip
+    if kind == "stop":
+        # buy stop: if open gaps above stop → fill at open; else at stop
+        if side == "long":
+            px = max(order_price, bar_open)
+            return px + spread + slip
+        # sell stop: if open gaps below stop → fill at open
+        px = min(order_price, bar_open)
+        return px - spread - slip
+    # market
+    if side == "long":
+        return order_price + spread + slip  # order_price should be last close/bid ref
+    return order_price - spread - slip
+
+
+def _can_fill_limit(side: str, limit: float, low: float, high: float, spread: float) -> bool:
+    if side == "long":
+        # ask = bid + spread; need ask <= limit → low <= limit - spread
+        return low <= limit - spread
+    # sell limit: bid >= limit
+    return high >= limit
+
+
+def _can_fill_stop(side: str, stop: float, low: float, high: float) -> bool:
+    if side == "long":
+        return high >= stop
+    return low <= stop
+
+
+def count_sl_cap_skips(orders: List[Order], max_sl_dist: float, spread: float = SPREAD) -> dict:
+    """How many orders fail the hard SL distance cap (before simulation)."""
+    total = len(orders)
+    skip = 0
+    for o in orders:
+        dist = sl_distance_price(o.price, o.sl, o.side, spread)
+        if dist > max_sl_dist + 1e-9:
+            skip += 1
+    return {"n_orders": total, "n_skipped": skip, "n_kept": total - skip,
+            "skip_pct": (100.0 * skip / total) if total else 0.0, "max_sl_dist": max_sl_dist}
+
+def simulate(
+    m1: pd.DataFrame,
+    orders: List[Order],
+    *,
+    initial_balance: float = 1000.0,
+    risk_pct: float = 0.005,
+    max_sl_dist: float | None = 7.5,
+    use_circuit_breaker: bool = True,
+    spread: float = SPREAD,
+    slip: float = SLIPPAGE,
+    commission: float = COMMISSION_PER_LOT,
+    market_delay_m1: int = MARKET_DELAY_M1,
+    dxy_filter_flag: bool = False,
+    vol_filter_flag: bool = False,
+    allow_fractional: bool = False,
+) -> tuple[pd.DataFrame, dict]:
+    if not orders:
+        return pd.DataFrame(), _empty_stats(initial_balance)
+
+    times = m1.index
+    high = m1["high"].values
+    low = m1["low"].values
+    close = m1["close"].values
+    open_ = m1["open"].values
+    n = len(times)
+
+    # Prepare armed entries: first eligible M1 index strictly AFTER arm_time (+ market delay)
+    pending = []
+    for o in orders:
+        j = times.searchsorted(o.arm_time, side="right")  # first bar with time > arm? 
+        # arm_time is bar END; first M1 at or after arm_time should NOT fill as signal bar.
+        # searchsorted(arm_time, side='left') finds first >= arm_time; that bar starts at arm_time
+        # which is the first bar AFTER the signal bar → eligible for waiting, but market delay applies.
+        j = times.searchsorted(o.arm_time, side="left")
+        if j >= n:
+            continue
+        # skip the first eligible bar for ALL kinds? Spec: "no fill on the signal bar".
+        # Signal bar ended at arm_time; M1 bar starting at arm_time is NOT the signal bar.
+        # So j is OK as first wait bar. Market orders get +delay.
+        if o.kind == "market":
+            j += market_delay_m1
+        if j >= n:
+            continue
+        # Also never fill on a bar whose timestamp == signal meta bar start if provided
+        expire_i = times.searchsorted(o.arm_time + pd.Timedelta(minutes=o.expire_minutes), side="right") - 1
+        expire_i = min(max(expire_i, j), n - 1)
+        risk = abs(o.price - o.sl) if o.kind != "market" else abs(o.price - o.sl)
+        # For stop/limit, risk from order price; for market from intended entry ref
+        raw = abs(o.price - o.sl)
+        if raw < 0.05:
+            continue
+        if raw / max(o.price, 1e-9) > 0.02:
+            continue
+        dist = sl_distance_price(o.price, o.sl, o.side, spread)
+        if max_sl_dist is not None and dist > max_sl_dist + 1e-9:
+            continue  # HARD CAP: cannot fit even 0.01 lot under risk budget
+        # Also skip if floor lot would be 0 under risk_pct * balance
+        # (unless fractional analysis mode: take every geometrically valid signal)
+        if not allow_fractional:
+            if _lots_from_risk_usd(initial_balance * risk_pct, dist) < 0.01:
+                continue
+        elif _lots_fractional(initial_balance * risk_pct, dist) <= 0:
+            continue
+        pending.append({
+            "order": o, "start_i": j, "expire_i": expire_i,
+            "risk_ref": dist,
+        })
+    pending.sort(key=lambda x: x["start_i"])
+
+    balance = initial_balance
+    trades: List[Trade] = []
+    pi = 0
+    consecutive_losses = 0
+    day_start = initial_balance
+    halted_day = None
+    current_day = None
+
+    while pi < len(pending):
+        item = pending[pi]
+        pi += 1
+        o: Order = item["order"]
+        filled = False
+        fill_i = None
+        fill_px = None
+
+        for i in range(item["start_i"], item["expire_i"] + 1):
+            t = times[i]
+            dow = getattr(t, "day_of_week", t.dayofweek)
+            day = t.strftime("%Y-%m-%d")
+            if day != current_day:
+                current_day = day
+                day_start = balance
+                consecutive_losses = 0
+            if dow >= 5 or halted_day == day:
+                continue
+            # session filter left to strategy; engine allows all weekdays in session if meta says so
+            # Strategies should only emit in-session arms.
+
+            if o.kind == "limit":
+                if not _can_fill_limit(o.side, o.price, low[i], high[i], spread):
+                    continue
+                fill_px = _fill_price(o.side, "limit", o.price, open_[i], spread, slip)
+            elif o.kind == "stop":
+                if not _can_fill_stop(o.side, o.price, low[i], high[i]):
+                    continue
+                fill_px = _fill_price(o.side, "stop", o.price, open_[i], spread, slip)
+            else:  # market — fill at this bar's open reference (close of prior already delayed)
+                ref = open_[i]
+                fill_px = _fill_price(o.side, "market", ref, open_[i], spread, slip)
+
+            filled = True
+            fill_i = i
+            break
+
+        if not filled:
+            continue
+
+        # Skip if fill already through SL or TP (gap) — no valid trade geometry
+        if o.side == "long" and (fill_px <= o.sl or fill_px >= o.tp):
+            continue
+        if o.side == "short" and (fill_px >= o.sl or fill_px <= o.tp):
+            continue
+        dist = sl_distance_price(fill_px, o.sl, o.side, spread)
+        if max_sl_dist is not None and dist > max_sl_dist + 1e-9:
+            continue
+        if allow_fractional:
+            lots = _lots_fractional(balance * risk_pct, dist)
+            if lots <= 0:
+                continue
+        else:
+            lots = _lots_from_risk_usd(balance * risk_pct, dist)
+            if lots < 0.01:
+                continue
+        # Optional partial-exit / split-leg sizing (NDS course 1/3 + 2/3)
+        sm = float((o.meta or {}).get("size_mult", 1.0) or 1.0)
+        if sm <= 0:
+            continue
+        if sm != 1.0:
+            lots = float(lots) * sm
+            if (not allow_fractional) and lots < 0.01:
+                # keep fractional remainder for analysis when split would floor to 0
+                lots = max(lots, 0.01 * sm)
+        risk = dist  # for R-multiple: use effective distance
+
+        # Same-bar / subsequent exit with worst-case SL first
+        exit_i, reason, exit_px, same = _resolve_exit(
+            o.side, fill_i, o.sl, o.tp, high, low, close, n, slip,
+            max_hold_minutes=o.max_hold_minutes,
+            min_hold_minutes=o.min_hold_minutes,
+            trail_activate_r=(o.meta or {}).get("trail_activate_r"),
+            fill_px=fill_px, planned_risk=abs(o.price - o.sl),
+        )
+        exit_t = times[exit_i]
+        entry_t = times[fill_i]
+        if o.side == "long":
+            move = exit_px - fill_px
+        else:
+            move = fill_px - exit_px
+        pnl = move * 100.0 * lots - commission * lots  # 0.01 lot => $1 per $1
+        # R vs planned SL distance (raw entry ref to SL); costs already in fill/exit
+        planned = abs(o.price - o.sl)
+        r_mult = move / planned if planned else 0.0
+        day = entry_t.strftime("%Y-%m-%d")
+        trades.append(Trade(
+            strategy=o.strategy, variant=o.variant, side=o.side, kind=o.kind,
+            entry_time=entry_t, exit_time=exit_t, entry=fill_px, exit=exit_px,
+            sl=o.sl, tp=o.tp, lots=lots, pnl_usd=pnl, r_multiple=r_mult,
+            reason=reason, duration_s=(exit_t - entry_t).total_seconds(),
+            same_m1_entry_exit=same, dxy_filter=dxy_filter_flag,
+            vol_filter=vol_filter_flag, day=day, month=entry_t.strftime("%Y-%m"),
+        ))
+        balance += pnl
+        if pnl < 0:
+            consecutive_losses += 1
+        else:
+            consecutive_losses = 0
+        if use_circuit_breaker:
+            if consecutive_losses >= 2 or (day_start - balance) / day_start >= 0.01:
+                halted_day = day
+
+        while pi < len(pending) and pending[pi]["start_i"] <= exit_i:
+            pi += 1
+
+        ed = exit_t.strftime("%Y-%m-%d")
+        if ed != current_day:
+            current_day = ed
+            day_start = balance
+            consecutive_losses = 0
+
+    tdf = pd.DataFrame([asdict(t) for t in trades])
+    return tdf, compute_stats(tdf, initial_balance, balance)
+
+
+def _resolve_exit(side, fill_i, sl, tp, high, low, close, n, slip, max_hold_minutes=None,
+                 min_hold_minutes=None, trail_activate_r=None, fill_px=None, planned_risk=None):
+    """Optional trail: after favorable excursion >= trail_activate_r * planned_risk, SL → BE (fill_px)."""
+    cur_sl = sl
+    be = fill_px
+    armed_trail = False
+    risk = planned_risk if planned_risk and planned_risk > 0 else abs((fill_px or 0) - sl)
+
+    def _maybe_arm(k):
+        nonlocal armed_trail, cur_sl
+        if trail_activate_r is None or be is None or risk <= 0 or armed_trail:
+            return
+        if side == "long":
+            if high[k] >= be + trail_activate_r * risk:
+                armed_trail = True
+                cur_sl = max(cur_sl, be)
+        else:
+            if low[k] <= be - trail_activate_r * risk:
+                armed_trail = True
+                cur_sl = min(cur_sl, be)
+
+    # Prop min-hold: ignore SL/TP exits until >= min_hold M1 bars after fill.
+    # Choice documented: defer exits; if SL/TP was traversed during the forbidden
+    # window, exit at that level on the first eligible bar (SL priority).
+    min_h = int(min_hold_minutes or 0)
+    pending_sl = False
+    pending_tp = False
+
+    def _check(k, same):
+        nonlocal cur_sl, pending_sl, pending_tp
+        _maybe_arm(k)
+        if side == "long":
+            if low[k] <= cur_sl:
+                pending_sl = True
+            if high[k] >= tp:
+                pending_tp = True
+        else:
+            if high[k] >= cur_sl:
+                pending_sl = True
+            if low[k] <= tp:
+                pending_tp = True
+        elapsed = k - fill_i
+        if elapsed < min_h:
+            return None
+        if pending_sl:
+            return (k, "SL", (cur_sl - slip) if side == "long" else (cur_sl + slip), same)
+        if pending_tp:
+            return (k, "TP", (tp - slip) if side == "long" else (tp + slip), same)
+        return None
+
+    r = _check(fill_i, True)
+    if r is not None:
+        return r
+
+    for k in range(fill_i + 1, n):
+        r = _check(k, False)
+        if r is not None:
+            return r
+        hold_lim = max_hold_minutes if max_hold_minutes is not None else 2880
+        if k - fill_i >= hold_lim:
+            return k, "TIME", float(close[k]), False
+    return n - 1, "EOD", float(close[-1]), False
+
+
+def _empty_stats(bal):
+    return {
+        "n_trades": 0, "win_rate": 0.0, "avg_r": 0.0, "expectancy_r": 0.0,
+        "profit_factor": 0.0, "max_dd_pct": 0.0, "net_pnl": 0.0,
+        "final_balance": bal, "trades_per_day": 0.0, "trading_days": 0,
+        "same_m1_n": 0, "same_m1_pct": 0.0,
+    }
+
+
+def compute_stats(tdf: pd.DataFrame, initial: float, final: float) -> dict:
+    if tdf is None or tdf.empty:
+        return _empty_stats(initial)
+    wins = tdf[tdf["pnl_usd"] > 0]
+    losses = tdf[tdf["pnl_usd"] <= 0]
+    gp = float(wins["pnl_usd"].sum()) if len(wins) else 0.0
+    gl = float(-losses["pnl_usd"].sum()) if len(losses) else 0.0
+    pf = (gp / gl) if gl > 0 else (999.0 if gp > 0 else 0.0)
+    eq = initial + tdf["pnl_usd"].cumsum()
+    peak = eq.cummax()
+    dd = ((peak - eq) / peak.replace(0, np.nan)).max()
+    days = int(tdf["day"].nunique()) or 1
+    same_n = int(tdf["same_m1_entry_exit"].sum()) if "same_m1_entry_exit" in tdf.columns else 0
+    return {
+        "n_trades": int(len(tdf)),
+        "win_rate": float((tdf["pnl_usd"] > 0).mean()),
+        "avg_r": float(tdf["r_multiple"].mean()),
+        "expectancy_r": float(tdf["r_multiple"].mean()),
+        "profit_factor": float(pf),
+        "max_dd_pct": float(dd * 100) if pd.notna(dd) else 0.0,
+        "net_pnl": float(tdf["pnl_usd"].sum()),
+        "final_balance": float(final),
+        "trades_per_day": float(len(tdf) / days),
+        "trading_days": days,
+        "same_m1_n": same_n,
+        "same_m1_pct": same_n / len(tdf),
+    }
+#!/usr/bin/env python3
+"""Audited pipeline: closed-bar Order engine, 6 strategies ± DXY ± vol, SL, OOS, combo, MC."""
+from __future__ import annotations
+import json
+import sys
+import traceback
+from pathlib import Path
+from collections import defaultdict
+import numpy as np
+import pandas as pd
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from engine import Order, simulate, SPREAD, SLIPPAGE, COMMISSION_PER_LOT
+from monte_carlo import run_mc
+from sl_analysis import classify_losses, summarize_causes
+from optimize import apply_quality_filters
+from combine import signal_overlap, outcome_correlation, signals_per_day_stats, build_combined_orders
+from strategies import (
+    generate_nds_fib, generate_idris, generate_sp2l, generate_pro_btb,
+    generate_micromap, generate_amd_po3_ifvg,
+)
+
+DATA = ROOT / "data"
+RES = ROOT / "results"
+RES.mkdir(parents=True, exist_ok=True)
+
+
+def load_data():
+    xau = pd.read_parquet(DATA / "XAUUSD.parquet")
+    if xau.index.tz is None:
+        xau.index = xau.index.tz_localize("UTC")
+    dxy = pd.read_parquet(DATA / "DXY_synth.parquet")
+    if dxy.index.tz is None:
+        dxy.index = dxy.index.tz_localize("UTC")
+    # DXY may be 15m close-only — ensure OHLC-ish
+    if "close" not in dxy.columns:
+        dxy = dxy.rename(columns={dxy.columns[0]: "close"})
+    return xau, dxy
+
+
+def split_oos(m1, oos_frac=0.30):
+    cut = m1.index[int(len(m1) * (1 - oos_frac))]
+    return m1[m1.index < cut], m1[m1.index >= cut], cut
+
+
+def filter_orders_period(orders, t0, t1):
+    return [o for o in orders if t0 <= o.arm_time < t1]
+
+
+def eval_orders(name, orders, m1_part, label, use_dxy, use_vol, variant=None):
+    if variant is not None:
+        orders = [o for o in orders if o.variant == variant]
+        vname = variant
+    else:
+        vname = "ALL"
+    # only arms that fall in this period
+    t0, t1 = m1_part.index[0], m1_part.index[-1] + pd.Timedelta(minutes=1)
+    orders = filter_orders_period(orders, t0, t1)
+    trades, stats = simulate(
+        m1_part, orders,
+        dxy_filter_flag=use_dxy, vol_filter_flag=use_vol,
+    )
+    stats.update({
+        "strategy": name, "variant": vname, "dxy_filter": use_dxy,
+        "vol_filter": use_vol, "label": label, "n_signals": len(orders),
+    })
+    if trades is not None and not trades.empty:
+        trades = trades.copy()
+        trades["strategy"] = name
+        trades["variant"] = trades["variant"] if "variant" in trades.columns else vname
+        trades["dxy_filter"] = use_dxy
+        trades["vol_filter"] = use_vol
+        trades["label"] = label
+    return trades, stats
+
+
+def write_results_md(meta, stats_df, cause_summary, spd_rows, overlap_df, corr_df,
+                     opt_compare, combined_stats, mc_df, weaknesses):
+    lines = []
+    lines.append("# نتایج بک‌تست حسابرسی‌شده استراتژی‌های طلا (XAUUSD)")
+    lines.append("")
+    lines.append("> موتور واحد با قوانین closed-bar، پر کردن ask، بدترین‌حالت SL، اسپرد ۰.۳۵ + اسلیپ ۰.۱۰، تأخیر ۱ کندل برای مارکت. اعداد اختراع نشده‌اند.")
+    lines.append("")
+    lines.append("## منبع داده و دوره")
+    lines.append(f"- طلا: `{meta['xau_source']}` — {meta['xau_bars']} کندل M1 از {meta['xau_start']} تا {meta['xau_end']}")
+    lines.append(f"- دلار: `{meta['dxy_source']}` — {meta['dxy_bars']} کندل")
+    lines.append(f"- برش out-of-sample: از {meta['oos_cut']} به بعد (~۳۰٪ آخر)")
+    lines.append(f"- هزینه: اسپرد {meta['costs']['spread_usd']}$ + اسلیپیج {meta['costs']['slippage_usd']}$ + کمیسیون {meta['costs']['commission_per_lot']}$/لات")
+    lines.append(f"- ریسک هر ترید: {meta['risk_per_trade']*100:.1f}% + مدارشکن (۲ ضرر متوالی یا ۱٪ افت روز)")
+    lines.append("")
+    lines.append("## تعریف‌های ماشینی")
+    lines.append("- **NDS Fib:** موج M15 ≥۱.۵×ATR؛ زون اصلی ۰.۶۲–۰.۷۸ (مقایسه: ۰.۷۸۶–۰.۸۶)؛ تأیید اینگالفینگ M1 بسته‌شده؛ مارکت بعد از بسته شدن + تأخیر ۱")
+    lines.append("- **ادریس:** H4 بسته‌شده + واگرایی مخفی RSI روی پیوت تأییدشده + اینساید بار؛ مارکت بعد از بسته شدن")
+    lines.append("- **SP2L (M5):** اسپایک + FVG؛ ورود A مارکت / B استاپ بعد از بسته شدن اصلاح؛ فیلتر HTF اختیاری")
+    lines.append("- **Pro BTB (M5):** شکست پیوت + برگشت؛ ۶ حالت ورود؛ سفارش بعد از بسته شدن کندل برگشت مسلح می‌شود")
+    lines.append("- **MicroMAP (M5):** اسپایک + کانال فشرده؛ فقط یک ورود H1/IB/H2")
+    lines.append("- **AMD/PO3 + iFVG:** انباشت = رنج آسیا ۰۰–۰۷ UTC (یا N کندل M5 کم‌نوسان)؛ دستکاری = سوئیپ یک‌طرف در پنجره لندن/نیویورک؛ توزیع = FVG هم‌جهت دستکاری که قیمت خلاف‌جهت از آن کلوز می‌کند (iFVG)؛ ورود مارکت/لیمیت بعد از کلوز اینورژن؛ SL پشت اکستریم دستکاری؛ TP رنج مقابل / ۱:۲ / ۱:۳")
+    lines.append("- **فیلتر DXY:** لانگ فقط وقتی DXY بسته‌شده زیر EMA50؛ شورت برعکس")
+    lines.append("- **پروکسی تیک‌والیوم:** حجم کندل سیگنال > ۱.۳× میانگین ۲۰")
+    lines.append("")
+
+    lines.append("## جدول رتبه‌بندی (OOS)")
+    oos = stats_df[stats_df["label"] == "OOS"].copy() if stats_df is not None and not stats_df.empty else pd.DataFrame()
+    if not oos.empty:
+        oos = oos.sort_values(["expectancy_r", "n_trades"], ascending=[False, False])
+        lines.append("| استراتژی | واریانت | DXY | Vol | معاملات | وین‌ریت | میانگین R | PF | MaxDD% | ترید/روز |")
+        lines.append("|---|---|---|---|---:|---:|---:|---:|---:|---:|")
+        for _, r in oos.iterrows():
+            lines.append(
+                f"| {r['strategy']} | {r['variant']} | {bool(r['dxy_filter'])} | {bool(r.get('vol_filter', False))} | "
+                f"{int(r['n_trades'])} | {r['win_rate']*100:.1f}% | {r['avg_r']:.2f} | "
+                f"{r['profit_factor']:.2f} | {r['max_dd_pct']:.1f} | {r['trades_per_day']:.2f} |"
+            )
+    else:
+        lines.append("_نتیجه OOS خالی بود._")
+    lines.append("")
+
+    lines.append("## مقایسه IS در برابر OOS (بدون DXY، بدون Vol)")
+    if stats_df is not None and not stats_df.empty:
+        lines.append("| استراتژی | واریانت | IS n / WR / R / PF | OOS n / WR / R / PF |")
+        lines.append("|---|---|---|---|")
+        base = stats_df[(stats_df["dxy_filter"] == False) & (stats_df.get("vol_filter", False) == False)] if "vol_filter" in stats_df.columns else stats_df[stats_df["dxy_filter"] == False]
+        for strat, g in base.groupby("strategy"):
+            o = g[g["label"] == "OOS"]
+            if o.empty:
+                continue
+            best = o.sort_values("expectancy_r", ascending=False).iloc[0]
+            v = best["variant"]
+            irow = g[(g["label"] == "IS") & (g["variant"] == v)]
+            def fmt(row):
+                if row is None or (hasattr(row, "empty") and row.empty):
+                    return "—"
+                r = row.iloc[0] if hasattr(row, "iloc") else row
+                return f"{int(r['n_trades'])} / {r['win_rate']*100:.0f}% / {r['avg_r']:.2f} / {r['profit_factor']:.2f}"
+            lines.append(f"| {strat} | {v} | {fmt(irow)} | {fmt(best.to_frame().T)} |")
+    lines.append("")
+
+    lines.append("## حکم فیلتر DXY و Vol")
+    if stats_df is not None and not stats_df.empty:
+        lines.append("| استراتژی | واریانت | پایه (n,R,PF) | +DXY | +Vol | +DXY+Vol |")
+        lines.append("|---|---|---|---|---|---|")
+        oos = stats_df[stats_df["label"] == "OOS"]
+        keys = oos[["strategy", "variant"]].drop_duplicates()
+        for _, k in keys.iterrows():
+            def pick(dxy, vol):
+                m = oos[(oos["strategy"] == k["strategy"]) & (oos["variant"] == k["variant"])
+                        & (oos["dxy_filter"] == dxy)]
+                if "vol_filter" in oos.columns:
+                    m = m[m["vol_filter"] == vol]
+                if m.empty:
+                    return "—"
+                r = m.iloc[0]
+                return f"{int(r['n_trades'])}/{r['avg_r']:.2f}/{r['profit_factor']:.2f}"
+            lines.append(f"| {k['strategy']} | {k['variant']} | {pick(False, False)} | {pick(True, False)} | {pick(False, True)} | {pick(True, True)} |")
+    lines.append("")
+
+    lines.append("## علت‌های حد ضرر (SL)")
+    if cause_summary is not None and not cause_summary.empty:
+        lines.append("| استراتژی | واریانت | n_SL | against_HTF | asian/lowvol | SL_tight | extended | dxy_disagree | london_whip |")
+        lines.append("|---|---|---:|---:|---:|---:|---:|---:|---:|")
+        for _, r in cause_summary.iterrows():
+            lines.append(
+                f"| {r['strategy']} | {r['variant']} | {int(r['n_losses'])} | "
+                f"{r.get('against_htf_trend',0)*100:.0f}% | {r.get('asian_or_low_vol_session',0)*100:.0f}% | "
+                f"{r.get('sl_too_tight_vs_atr',0)*100:.0f}% | {r.get('entry_extended',0)*100:.0f}% | "
+                f"{r.get('dxy_disagreement',0)*100:.0f}% | {r.get('london_open_whipsaw',0)*100:.0f}% |"
+            )
+    lines.append("")
+
+    lines.append("## سیگنال در روز")
+    if spd_rows:
+        lines.append("| استراتژی | واریانت | میانگین/روز | میانه | % روز صفر | لندن | نیویورک |")
+        lines.append("|---|---|---:|---:|---:|---:|---:|")
+        for r in spd_rows:
+            lines.append(
+                f"| {r['strategy']} | {r['variant']} | {r['avg']:.2f} | {r['median']:.1f} | "
+                f"{r['pct_zero_days']:.0f}% | {r['london_avg']:.2f} | {r['ny_avg']:.2f} |"
+            )
+    lines.append("")
+
+    lines.append("## هم‌پوشانی و همبستگی")
+    if overlap_df is not None and not overlap_df.empty:
+        lines.append(overlap_df.to_markdown(index=False))
+    lines.append("")
+    if corr_df is not None and not corr_df.empty:
+        lines.append("همبستگی PnL روزانه:")
+        lines.append(corr_df.round(2).to_markdown())
+    lines.append("")
+
+    lines.append("## فیلترهای کیفیت (OOS)")
+    if opt_compare is not None and not opt_compare.empty:
+        lines.append(opt_compare.to_markdown(index=False))
+    lines.append("")
+
+    lines.append("## ترکیب پورتفو (OOS)")
+    if combined_stats:
+        for cs in combined_stats:
+            lines.append(f"- **{cs.get('name','combo')}**: n={cs.get('n_trades',0)}, WR={cs.get('win_rate',0)*100:.1f}%, "
+                         f"R={cs.get('avg_r',0):.2f}, PF={cs.get('profit_factor',0):.2f}, DD={cs.get('max_dd_pct',0):.1f}%")
+    lines.append("")
+
+    lines.append("## مونت‌کارلو (فقط واریانت‌هایی با PF OOS ≥ ۱.۱)")
+    if mc_df is not None and not mc_df.empty:
+        lines.append(mc_df.to_markdown(index=False))
+    else:
+        lines.append("_هیچ واریانتی آستانه PF≥۱.۱ روی OOS را رد نکرد؛ MC اجرا نشد یا خالی بود._")
+    lines.append("")
+
+    lines.append("## نقاط ضعف و محدودیت‌ها")
+    for w in weaknesses:
+        lines.append(f"- {w}")
+    lines.append("")
+    lines.append("## حکم نهایی")
+    # honest top-line from OOS
+    if stats_df is not None and not stats_df.empty:
+        oos = stats_df[stats_df["label"] == "OOS"]
+        pos = oos[(oos["n_trades"] >= 20) & (oos["expectancy_r"] > 0) & (oos["profit_factor"] >= 1.0)]
+        if pos.empty:
+            lines.append("هیچ واریانتی با ≥۲۰ ترید OOS و expectancy مثبت و PF≥۱ پیدا نشد. "
+                         "با قوانین حسابرسی‌شده، لبه قوی و پایدار در این دوره دیده نشد.")
+        else:
+            best = pos.sort_values("expectancy_r", ascending=False).iloc[0]
+            lines.append(
+                f"بهترین OOS قابل‌قبول: **{best['strategy']} / {best['variant']}** "
+                f"(DXY={bool(best['dxy_filter'])}, Vol={bool(best.get('vol_filter', False))}): "
+                f"n={int(best['n_trades'])}, WR={best['win_rate']*100:.1f}%, R={best['avg_r']:.2f}, "
+                f"PF={best['profit_factor']:.2f}, DD={best['max_dd_pct']:.1f}%. "
+                "این به معنی تضمین سود نیست؛ فقط بهترین نتیجه در این نمونه است."
+            )
+    (ROOT / "RESULTS.md").write_text("\n".join(lines), encoding="utf-8")
+    print("Wrote", ROOT / "RESULTS.md")
+
+
+def main():
+    print("Loading data...")
+    m1, dxy = load_data()
+    m1_is, m1_oos, cut = split_oos(m1, 0.30)
+    print(f"M1={len(m1)} IS={len(m1_is)} OOS={len(m1_oos)} cut={cut}")
+
+    meta = {
+        "xau_source": "Dukascopy XAU/USD M1",
+        "xau_bars": len(m1),
+        "xau_start": str(m1.index[0]),
+        "xau_end": str(m1.index[-1]),
+        "dxy_source": "Synthetic ICE DXY from FX legs",
+        "dxy_bars": len(dxy),
+        "oos_cut": str(cut),
+        "costs": {"spread_usd": SPREAD, "slippage_usd": SLIPPAGE, "commission_per_lot": COMMISSION_PER_LOT},
+        "risk_per_trade": 0.005,
+        "engine": "audited_closed_bar_ask_worstSL_delay1",
+    }
+    (RES / "meta.json").write_text(json.dumps(meta, indent=2, default=str))
+
+    all_stats = []
+    all_trades = []
+    orders_cache = {}  # (strat, dxy, vol, extra) -> orders
+    spd_rows = []
+    weaknesses = []
+
+    def run_variant_set(name, orders, use_dxy, use_vol):
+        variants = sorted({o.variant for o in orders}) or ["none"]
+        for label, part in (("IS", m1_is), ("OOS", m1_oos)):
+            for v in variants:
+                tr, st = eval_orders(name, orders, part, label, use_dxy, use_vol, variant=v)
+                all_stats.append(st)
+                if tr is not None and not tr.empty:
+                    all_trades.append(tr)
+
+    # ---- Generate base configs ----
+    configs = []
+    for use_dxy in (False, True):
+        for use_vol in (False, True):
+            configs.append(("NDS_Fib", dict(use_dxy=use_dxy, use_vol=use_vol, rr=1.5)))
+            configs.append(("NDS_Fib", dict(use_dxy=use_dxy, use_vol=use_vol, rr=2.0)))
+            configs.append(("Idris", dict(use_dxy=use_dxy, use_vol=use_vol, rr=3.0)))
+            configs.append(("SP2L", dict(use_dxy=use_dxy, use_vol=use_vol, use_htf=True)))
+            configs.append(("SP2L_noHTF", dict(use_dxy=use_dxy, use_vol=use_vol, use_htf=False)))
+            configs.append(("ProBTB", dict(use_dxy=use_dxy, use_vol=use_vol, rr=2.0)))
+            configs.append(("MicroMAP", dict(use_dxy=use_dxy, use_vol=use_vol)))
+
+    # AMD configs: range_mode × tf × entry × tp × htf × dxy × vol (subset to keep runtime sane)
+    amd_cfgs = []
+    for range_mode in ("asian", "m5_lowatr"):
+        for tf in ("M5", "M1"):
+            for entry_mode in ("market", "limit"):
+                for tp_mode in ("range", "rr2", "rr3"):
+                    for use_htf in (False, True):
+                        for use_dxy in (False, True):
+                            for use_vol in (False, True):
+                                amd_cfgs.append(dict(
+                                    range_mode=range_mode, tf=tf, entry_mode=entry_mode,
+                                    tp_mode=tp_mode, use_htf=use_htf, use_dxy=use_dxy, use_vol=use_vol,
+                                ))
+    # Too many: prioritize core grid first — asian/M5/market+limit × tp × htf × dxy × vol
+    amd_cfgs = [c for c in amd_cfgs if not (c["tf"] == "M1" and c["range_mode"] == "m5_lowatr")]
+    # Still a lot (2*2*2*3*2*2*2 = 192 for asian+m5 with both TF...). Cut M1 to asian only market.
+    amd_core = []
+    for range_mode in ("asian", "m5_lowatr"):
+        for entry_mode in ("market", "limit"):
+            for tp_mode in ("range", "rr2", "rr3"):
+                for use_htf in (False, True):
+                    for use_dxy in (False, True):
+                        for use_vol in (False, True):
+                            amd_core.append(dict(
+                                range_mode=range_mode, tf="M5", entry_mode=entry_mode,
+                                tp_mode=tp_mode, use_htf=use_htf, use_dxy=use_dxy, use_vol=use_vol,
+                            ))
+    # Add a few M1 asian market variants
+    for tp_mode in ("range", "rr2", "rr3"):
+        for use_htf in (False, True):
+            for use_dxy in (False, True):
+                amd_core.append(dict(
+                    range_mode="asian", tf="M1", entry_mode="market",
+                    tp_mode=tp_mode, use_htf=use_htf, use_dxy=use_dxy, use_vol=False,
+                ))
+
+    print(f"AMD configs: {len(amd_core)}")
+
+    generators = {
+        "NDS_Fib": lambda kw: generate_nds_fib(m1, dxy, **kw),
+        "Idris": lambda kw: generate_idris(m1, dxy, **kw),
+        "SP2L": lambda kw: generate_sp2l(m1, dxy, **kw),
+        "SP2L_noHTF": lambda kw: generate_sp2l(m1, dxy, **{**kw, "use_htf": False}),
+        "ProBTB": lambda kw: generate_pro_btb(m1, dxy, **kw),
+        "MicroMAP": lambda kw: generate_micromap(m1, dxy, **kw),
+    }
+
+    # Deduplicate generation: generate once per unique kwargs fingerprint for non-AMD
+    print("Generating strategy orders...")
+    seen = set()
+    for name, kw in configs:
+        key = (name, tuple(sorted(kw.items())))
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            print(f"  {name} {kw} ...", flush=True)
+            ords = generators[name](kw)
+            print(f"    -> {len(ords)} orders")
+            orders_cache[key] = ords
+            # signals/day for base no-filter
+            if not kw.get("use_dxy") and not kw.get("use_vol"):
+                by_v = defaultdict(list)
+                for o in ords:
+                    by_v[o.variant].append(o)
+                for v, ol in by_v.items():
+                    spd = signals_per_day_stats(ol)
+                    spd_rows.append({"strategy": name, "variant": v, **{k: spd[k] for k in
+                                    ("avg", "median", "pct_zero_days", "london_avg", "ny_avg")}})
+            run_variant_set(name, ords, kw.get("use_dxy", False), kw.get("use_vol", False))
+        except Exception as e:
+            traceback.print_exc()
+            weaknesses.append(f"{name} generation failed: {e}")
+
+    print("Generating AMD/PO3+iFVG (base scans then DXY/Vol gates)...")
+    from strategies.common import apply_dxy_gate, apply_vol_gate
+    from indicators import resample_ohlc, vol_ma
+    # Unique base keys without dxy/vol
+    base_keys = []
+    seen_b = set()
+    for kw in amd_core:
+        bk = (kw["range_mode"], kw["tf"], kw["entry_mode"], kw["tp_mode"], kw["use_htf"])
+        if bk not in seen_b:
+            seen_b.add(bk)
+            base_keys.append(bk)
+    print(f"  AMD base scans: {len(base_keys)} (from {len(amd_core)} configs)")
+    amd_base = {}
+    for i, bk in enumerate(base_keys):
+        range_mode, tf, entry_mode, tp_mode, use_htf = bk
+        print(f"  AMD base {i+1}/{len(base_keys)} {bk}", flush=True)
+        try:
+            ords = generate_amd_po3_ifvg(
+                m1, dxy, range_mode=range_mode, tf=tf, entry_mode=entry_mode,
+                tp_mode=tp_mode, use_htf=use_htf, use_dxy=False, use_vol=False,
+            )
+            amd_base[bk] = ords
+            print(f"    -> {len(ords)} orders")
+            if not use_htf:
+                by_v = defaultdict(list)
+                for o in ords:
+                    by_v[o.variant].append(o)
+                for v, ol in by_v.items():
+                    spd = signals_per_day_stats(ol)
+                    spd_rows.append({"strategy": "AMD_PO3_iFVG", "variant": v, **{k: spd[k] for k in
+                                    ("avg", "median", "pct_zero_days", "london_avg", "ny_avg")}})
+        except Exception as e:
+            traceback.print_exc()
+            weaknesses.append(f"AMD base {bk} failed: {e}")
+            amd_base[bk] = []
+
+    # Precompute vol series per TF
+    m5 = resample_ohlc(m1, "5min")
+    vol_series = {
+        "M5": (m5["volume"], vol_ma(m5["volume"], 20), 5) if "volume" in m5.columns else None,
+        "M1": (m1["volume"], vol_ma(m1["volume"], 20), 1) if "volume" in m1.columns else None,
+    }
+
+    for kw in amd_core:
+        bk = (kw["range_mode"], kw["tf"], kw["entry_mode"], kw["tp_mode"], kw["use_htf"])
+        ords = list(amd_base.get(bk, []))
+        if kw.get("use_vol"):
+            vs = vol_series.get(kw["tf"])
+            if vs is not None:
+                ords = apply_vol_gate(ords, vs[0], vs[1], True, 1.3, vs[2])
+            else:
+                ords = []
+        if kw.get("use_dxy"):
+            ords = apply_dxy_gate(ords, dxy, True)
+        key = ("AMD_PO3_iFVG", tuple(sorted(kw.items())))
+        orders_cache[key] = ords
+        run_variant_set("AMD_PO3_iFVG", ords, kw.get("use_dxy", False), kw.get("use_vol", False))
+
+    stats_df = pd.DataFrame(all_stats)
+    trades_df = pd.concat(all_trades, ignore_index=True) if all_trades else pd.DataFrame()
+    stats_df.to_csv(RES / "stats_all.csv", index=False)
+    if not trades_df.empty:
+        trades_df.to_csv(RES / "trades_all.csv", index=False)
+    print(f"Stats rows={len(stats_df)} trade rows={len(trades_df)}")
+
+    # ---- SL analysis on OOS baseline (no dxy no vol) ----
+    print("SL cause analysis...")
+    cause_parts = []
+    if not trades_df.empty:
+        oos_tr = trades_df[(trades_df["label"] == "OOS") & (trades_df["dxy_filter"] == False)]
+        if "vol_filter" in oos_tr.columns:
+            oos_tr = oos_tr[oos_tr["vol_filter"] == False]
+        for strat, g in oos_tr.groupby("strategy"):
+            try:
+                clf = classify_losses(g, m1, dxy)
+                if not clf.empty:
+                    clf.to_csv(RES / f"sl_causes_{strat}.csv", index=False)
+                    cause_parts.append(clf)
+            except Exception as e:
+                weaknesses.append(f"SL analysis {strat}: {e}")
+    cause_summary = summarize_causes(pd.concat(cause_parts, ignore_index=True)) if cause_parts else pd.DataFrame()
+    if not cause_summary.empty:
+        cause_summary.to_csv(RES / "sl_cause_summary.csv", index=False)
+
+    # ---- Quality filters on top OOS candidates ----
+    print("Quality filter compare...")
+    opt_rows = []
+    if not stats_df.empty:
+        oos = stats_df[(stats_df["label"] == "OOS") & (stats_df["dxy_filter"] == False)]
+        if "vol_filter" in oos.columns:
+            oos = oos[oos["vol_filter"] == False]
+        oos = oos[oos["variant"] != "ALL"].sort_values("n_trades", ascending=False)
+        # pick up to 8 most-traded variants across strategies
+        picked = []
+        for strat, g in oos.groupby("strategy"):
+            top = g.sort_values("n_trades", ascending=False).head(2)
+            for _, r in top.iterrows():
+                picked.append((r["strategy"], r["variant"]))
+        for strat, variant in picked[:12]:
+            # find matching orders in cache
+            base_ords = None
+            for key, ords in orders_cache.items():
+                if key[0] == strat or (strat == "SP2L_noHTF" and key[0] == "SP2L_noHTF"):
+                    # prefer no dxy no vol
+                    kw = dict(key[1])
+                    if kw.get("use_dxy") or kw.get("use_vol"):
+                        continue
+                    subset = [o for o in ords if o.variant == variant]
+                    if subset:
+                        base_ords = subset
+                        break
+            if not base_ords:
+                continue
+            for tag, filt_kw in [
+                ("baseline", dict(require_htf=False, require_dxy=False)),
+                ("htf", dict(require_htf=True, require_dxy=False)),
+                ("htf+dxy", dict(require_htf=True, require_dxy=True)),
+                ("htf+minsl", dict(require_htf=True, require_dxy=False, min_sl_atr=0.8)),
+            ]:
+                fo = apply_quality_filters(base_ords, m1, dxy, **filt_kw)
+                tr, st = eval_orders(strat, fo, m1_oos, "OOS", filt_kw.get("require_dxy", False), False, variant=variant)
+                opt_rows.append({
+                    "strategy": strat, "variant": variant, "filter": tag,
+                    "n_signals": st["n_signals"], "n_trades": st["n_trades"],
+                    "win_rate": st["win_rate"], "avg_r": st["avg_r"],
+                    "profit_factor": st["profit_factor"], "max_dd_pct": st["max_dd_pct"],
+                })
+    opt_compare = pd.DataFrame(opt_rows)
+    if not opt_compare.empty:
+        opt_compare.to_csv(RES / "opt_compare.csv", index=False)
+
+    # ---- Combination ----
+    print("Portfolio combination...")
+    combined_stats = []
+    overlap_df = pd.DataFrame()
+    corr_df = pd.DataFrame()
+    try:
+        # pick best OOS variant per strategy (no dxy/vol, n>=10)
+        by_strat_orders = {}
+        if not stats_df.empty:
+            oos = stats_df[(stats_df["label"] == "OOS") & (stats_df["dxy_filter"] == False)]
+            if "vol_filter" in oos.columns:
+                oos = oos[oos["vol_filter"] == False]
+            oos = oos[oos["variant"] != "ALL"]
+            for strat, g in oos.groupby("strategy"):
+                g2 = g[g["n_trades"] >= 5].sort_values("expectancy_r", ascending=False)
+                if g2.empty:
+                    g2 = g.sort_values("n_trades", ascending=False)
+                if g2.empty:
+                    continue
+                best_v = g2.iloc[0]["variant"]
+                # find orders
+                for key, ords in orders_cache.items():
+                    if key[0] != strat:
+                        continue
+                    kw = dict(key[1])
+                    if kw.get("use_dxy") or kw.get("use_vol"):
+                        continue
+                    subset = [o for o in ords if o.variant == best_v]
+                    if subset:
+                        by_strat_orders[strat] = subset
+                        break
+        if by_strat_orders:
+            overlap_df = signal_overlap(by_strat_orders, 30)
+            overlap_df.to_csv(RES / "signal_overlap.csv", index=False)
+            combo = build_combined_orders(by_strat_orders)
+            tr, st = eval_orders("COMBO", combo, m1_oos, "OOS", False, False, variant=None)
+            st["name"] = "best_variants_merged"
+            st["variant"] = "merged"
+            combined_stats.append(st)
+            if tr is not None and not tr.empty:
+                tr.to_csv(RES / "combined_oos_trades.csv", index=False)
+                # rebuild strategy tags from original
+                corr_src = []
+                for strat, ords in by_strat_orders.items():
+                    t2, _ = eval_orders(strat, ords, m1_oos, "OOS", False, False)
+                    if t2 is not None and not t2.empty:
+                        corr_src.append(t2)
+                if corr_src:
+                    corr_df = outcome_correlation(pd.concat(corr_src, ignore_index=True))
+                    corr_df.to_csv(RES / "daily_pnl_corr.csv")
+    except Exception as e:
+        traceback.print_exc()
+        weaknesses.append(f"combo failed: {e}")
+
+    # ---- Monte Carlo for PF>=1.1 OOS ----
+    print("Monte Carlo...")
+    mc_rows = []
+    if not stats_df.empty and not trades_df.empty:
+        oos_s = stats_df[stats_df["label"] == "OOS"]
+        cand = oos_s[(oos_s["profit_factor"] >= 1.1) & (oos_s["n_trades"] >= 20) & (oos_s["variant"] != "ALL")]
+        for _, r in cand.iterrows():
+            mask = (
+                (trades_df["strategy"] == r["strategy"]) &
+                (trades_df["variant"] == r["variant"]) &
+                (trades_df["label"] == "OOS") &
+                (trades_df["dxy_filter"] == r["dxy_filter"])
+            )
+            if "vol_filter" in trades_df.columns:
+                mask &= trades_df["vol_filter"] == r.get("vol_filter", False)
+            sub = trades_df[mask]
+            if len(sub) < 15:
+                continue
+            mc = run_mc(sub["r_multiple"].values, n_sims=3000)
+            if mc is None or mc.empty:
+                continue
+            mc = mc.copy()
+            mc["strategy"] = r["strategy"]
+            mc["variant"] = r["variant"]
+            mc["dxy"] = r["dxy_filter"]
+            mc["vol"] = r.get("vol_filter", False)
+            mc_rows.append(mc)
+    mc_df = pd.concat(mc_rows, ignore_index=True) if mc_rows else pd.DataFrame()
+    if not mc_df.empty:
+        mc_df.to_csv(RES / "monte_carlo.csv", index=False)
+
+    # Speeds
+    (RES / "signals_per_day.json").write_text(json.dumps(spd_rows, indent=2, default=str))
+
+    weaknesses.append(
+        "داده DXY مصنوعی از پایه‌های FX است نه ICE نقدی؛ پروکسی تیک‌والیوم جایگزین اردرفلو واقعی نیست."
+    )
+    weaknesses.append(
+        "قوانین ICT/AMD ساده‌سازی ماشینی‌اند؛ انتخاب دستی تریدر ممکن است فرق کند."
+    )
+    weaknesses.append(
+        "اسپرد/اسلیپ ثابت‌اند؛ در خبر و سشن کم‌نقد ممکن است بدتر باشد."
+    )
+
+    write_results_md(meta, stats_df, cause_summary, spd_rows, overlap_df, corr_df,
+                     opt_compare, combined_stats, mc_df, weaknesses)
+    print("DONE")
+
+
+if __name__ == "__main__":
+    main()
+#!/usr/bin/env python3
+"""Audited batch: risk caps $5/$7.5, confirmation search (IS choose / OOS judge),
+walk-forward, MC, KEEP/MAYBE/DROP → RESULTS.md (Persian).
+
+Rigor preserved; process is scripted/batched.
+"""
+from __future__ import annotations
+import json, sys, traceback
+from pathlib import Path
+from collections import defaultdict
+from copy import copy
+import numpy as np
+import pandas as pd
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from engine import (
+    Order, simulate, count_sl_cap_skips, sl_distance_price,
+    SPREAD, SLIPPAGE, COMMISSION_PER_LOT,
+)
+from monte_carlo import run_mc
+from sl_analysis import classify_losses, summarize_causes
+from combine import signal_overlap, outcome_correlation, signals_per_day_stats, build_combined_orders
+from indicators import ema, atr, resample_ohlc, last_closed_value, in_session, vol_ma
+from strategies import (
+    generate_nds_fib, generate_idris, generate_sp2l, generate_pro_btb,
+    generate_micromap, generate_amd_po3_ifvg,
+)
+from strategies.common import apply_dxy_gate, apply_vol_gate, apply_htf_gate
+
+DATA, RES = ROOT / "data", ROOT / "results"
+RES.mkdir(parents=True, exist_ok=True)
+CAPS = (5.0, 7.5)
+RISK_PCT = {5.0: 0.005, 7.5: 0.0075}
+
+
+def load():
+    m1 = pd.read_parquet(DATA / "XAUUSD.parquet")
+    if m1.index.tz is None:
+        m1.index = m1.index.tz_localize("UTC")
+    dxy = pd.read_parquet(DATA / "DXY_synth.parquet")
+    if dxy.index.tz is None:
+        dxy.index = dxy.index.tz_localize("UTC")
+    if "close" not in dxy.columns:
+        dxy = dxy.rename(columns={dxy.columns[0]: "close"})
+    return m1, dxy
+
+
+def period_orders(orders, t0, t1):
+    return [o for o in orders if t0 <= o.arm_time < t1]
+
+
+def filter_cap(orders, max_sl):
+    out = []
+    for o in orders:
+        if sl_distance_price(o.price, o.sl, o.side) <= max_sl + 1e-9:
+            out.append(o)
+    return out
+
+
+def eval_set(orders, m1, label, cap, dxy_f=False, vol_f=False, strategy=None, variant=None):
+    risk = RISK_PCT[cap]
+    t0, t1 = m1.index[0], m1.index[-1] + pd.Timedelta(minutes=1)
+    oo = period_orders(orders, t0, t1)
+    oo = filter_cap(oo, cap)
+    if variant is not None:
+        oo = [o for o in oo if o.variant == variant]
+    tr, st = simulate(m1, oo, risk_pct=risk, max_sl_dist=cap,
+                      dxy_filter_flag=dxy_f, vol_filter_flag=vol_f)
+    st.update({"label": label, "cap": cap, "dxy_filter": dxy_f, "vol_filter": vol_f,
+               "n_signals": len(oo), "strategy": strategy or (tr["strategy"].iloc[0] if tr is not None and len(tr) else "?"),
+               "variant": variant or "ALL"})
+    if tr is not None and not tr.empty:
+        tr = tr.copy()
+        tr["label"] = label
+        tr["cap"] = cap
+    return tr, st
+
+
+# ---------- confirmation filters (few params; chosen on IS) ----------
+def apply_confirmations(orders, m1, dxy, flags: dict):
+    """flags: htf, dxy, vol, session_london_ny, block_london_open, min_sl_atr, atr_regime_ok, sweep_proxy"""
+    if not orders:
+        return []
+    m15 = resample_ohlc(m1, "15min")
+    m15_ema = ema(m15["close"], 50)
+    m1_atr = atr(m1, 14)
+    m15_atr = atr(m15, 14)
+    out = list(orders)
+
+    if flags.get("htf"):
+        out = apply_htf_gate(out, m15["close"], m15_ema, True)
+    if flags.get("dxy"):
+        out = apply_dxy_gate(out, dxy, True)
+    if flags.get("vol"):
+        # use M1 vol as proxy at signal bar when possible
+        vma = vol_ma(m1["volume"], 20)
+        out = apply_vol_gate(out, m1["volume"], vma, True, 1.3, 1)
+
+    filtered = []
+    for o in out:
+        t = o.arm_time
+        h = t.hour
+        if flags.get("session_london_ny") and not (7 <= h < 21):
+            continue
+        if flags.get("block_london_open") and 7 <= h < 9:
+            continue
+        if flags.get("block_ny_late") and h >= 19:
+            continue
+        ai = m1_atr.index.searchsorted(t, side="left") - 1  # last M1 fully before arm
+        atr_i = float(m1_atr.iloc[ai]) if ai >= 0 else np.nan
+        risk = abs(o.price - o.sl)
+        if flags.get("min_sl_atr") and atr_i and atr_i > 0:
+            if risk < flags["min_sl_atr"] * atr_i:
+                continue
+        if flags.get("max_sl_atr") and atr_i and atr_i > 0:
+            if risk > flags["max_sl_atr"] * atr_i:
+                continue
+        if flags.get("atr_regime_ok") and atr_i and atr_i > 0:
+            # require ATR not in bottom 30% of recent 500 bars
+            w = m1_atr.iloc[max(0, ai - 500):ai + 1].dropna()
+            if len(w) > 50 and atr_i < float(w.quantile(0.30)):
+                continue
+        if flags.get("not_extended") and atr_i and atr_i > 0:
+            # last CLOSED M15 only (no unfinished-bar lookahead)
+            c15 = last_closed_value(m15["close"], t, 15)
+            e15 = last_closed_value(m15_ema, t, 15)
+            a15v = last_closed_value(m15_atr, t, 15)
+            if c15 is not None and e15 is not None:
+                dist = abs(o.price - e15)
+                a15 = a15v if (a15v is not None and a15v > 0) else atr_i
+                if dist > 2.0 * a15:
+                    continue
+        filtered.append(o)
+    return filtered
+
+
+CANDIDATE_FILTERS = [
+    ("baseline", {}),
+    ("htf", {"htf": True}),
+    ("dxy", {"dxy": True}),
+    ("vol", {"vol": True}),
+    ("htf+dxy", {"htf": True, "dxy": True}),
+    ("htf+vol", {"htf": True, "vol": True}),
+    ("htf+dxy+vol", {"htf": True, "dxy": True, "vol": True}),
+    ("session", {"session_london_ny": True}),
+    ("htf+session", {"htf": True, "session_london_ny": True}),
+    ("htf+minsl0.6", {"htf": True, "min_sl_atr": 0.6}),
+    ("htf+atr_regime", {"htf": True, "atr_regime_ok": True}),
+    ("htf+not_ext", {"htf": True, "not_extended": True}),
+    ("htf+dxy+session", {"htf": True, "dxy": True, "session_london_ny": True}),
+    ("block_ldn_open+htf", {"htf": True, "block_london_open": True}),
+]
+
+
+def walk_forward_folds(m1, n_folds=4):
+    """Expanding IS → next OOS slice. Returns list of (is_df, oos_df, name)."""
+    times = m1.index
+    n = len(times)
+    # first 40% warm IS, then 4 equal OOS chunks of remaining 60%
+    warm = int(n * 0.40)
+    rest = n - warm
+    fold_sz = rest // n_folds
+    folds = []
+    for k in range(n_folds):
+        oos0 = warm + k * fold_sz
+        oos1 = warm + (k + 1) * fold_sz if k < n_folds - 1 else n
+        is_df = m1.iloc[:oos0]
+        oos_df = m1.iloc[oos0:oos1]
+        folds.append((is_df, oos_df, f"WF{k+1}"))
+    return folds
+
+
+def pick_best_filter_is(base_orders, m1_is, dxy, cap, variants):
+    """Choose filter+variant on IS by expectancy (n>=15). Return (variant, filter_name, flags, is_stats)."""
+    best = None
+    for v in variants:
+        vo = [o for o in base_orders if o.variant == v]
+        if not vo:
+            continue
+        for fname, flags in CANDIDATE_FILTERS:
+            fo = apply_confirmations(vo, m1_is, dxy, flags)
+            tr, st = eval_set(fo, m1_is, "IS", cap, strategy="x", variant=v)
+            if st["n_trades"] < 15:
+                continue
+            score = (st["expectancy_r"], st["profit_factor"], st["n_trades"])
+            row = (score, v, fname, flags, st)
+            if best is None or score > best[0]:
+                best = row
+    if best is None:
+        # fallback: most trades baseline
+        for v in variants:
+            vo = [o for o in base_orders if o.variant == v]
+            tr, st = eval_set(vo, m1_is, "IS", cap, strategy="x", variant=v)
+            score = (st["expectancy_r"], st["profit_factor"], st["n_trades"])
+            row = (score, v, "baseline", {}, st)
+            if best is None or st["n_trades"] > best[4]["n_trades"]:
+                best = row
+    return best
+
+
+def verdict_from(oos_st, wf_positive_frac, mc_pass_05):
+    """Brutal KEEP / MAYBE / DROP."""
+    n = oos_st.get("n_trades", 0)
+    r = oos_st.get("expectancy_r", 0)
+    pf = oos_st.get("profit_factor", 0)
+    dd = oos_st.get("max_dd_pct", 100)
+    tpd = oos_st.get("trades_per_day", 0)
+    if n < 20 or r <= 0 or pf < 1.05:
+        return "DROP", "OOS ضعیف/نمونه کم یا expectancy≤0 یا PF<1.05"
+    if dd > 25:
+        return "DROP", f"MaxDD OOS={dd:.1f}% بیش از حد برای پراپ"
+    if wf_positive_frac < 0.5:
+        return "DROP", f"walk-forward ناپایدار ({wf_positive_frac*100:.0f}% فولد مثبت)"
+    if r >= 0.15 and pf >= 1.2 and wf_positive_frac >= 0.75 and (mc_pass_05 is None or mc_pass_05 >= 0.25):
+        return "KEEP", "لبه OOS مثبت، WF پایدار، DD قابل‌قبول"
+    if r > 0 and pf >= 1.05 and wf_positive_frac >= 0.5:
+        return "MAYBE", "لبه ضعیف/حاشیه کم؛ نیاز به نمونه بیشتر یا فیلتر سخت‌تر"
+    return "DROP", "معیار KEEP/MAYBE برآورده نشد"
+
+
+def main():
+    print("LOAD", flush=True)
+    m1, dxy = load()
+    cut = m1.index[int(len(m1) * 0.70)]
+    m1_is, m1_oos = m1[m1.index < cut], m1[m1.index >= cut]
+    print(f"bars={len(m1)} IS={len(m1_is)} OOS={len(m1_oos)} cut={cut}", flush=True)
+
+    meta = {
+        "xau_source": "Dukascopy XAU/USD M1",
+        "xau_bars": len(m1), "xau_start": str(m1.index[0]), "xau_end": str(m1.index[-1]),
+        "dxy_source": "Synthetic ICE DXY from FX legs", "dxy_bars": len(dxy),
+        "oos_cut": str(cut),
+        "costs": {"spread": SPREAD, "slip": SLIPPAGE, "commission": COMMISSION_PER_LOT},
+        "risk_caps_usd": list(CAPS),
+        "lot_rule": "floor(risk_usd/sl_dist_incl_spread)*0.01; skip if dist>cap or lot<0.01",
+        "engine": "audited_closed_bar_ask_worstSL_delay1_hardSLcap",
+    }
+    (RES / "meta.json").write_text(json.dumps(meta, indent=2, default=str))
+
+    # ---- generate base order pools (once each) ----
+    print("GENERATE bases...", flush=True)
+    bases = {}
+    try:
+        print("  NDS...", flush=True)
+        bases["NDS_Fib"] = generate_nds_fib(m1, dxy, use_dxy=False, use_vol=False, rr=1.5)
+        # also rr2 as extra variants already in zone names; add rr2
+        bases["NDS_Fib"] += generate_nds_fib(m1, dxy, use_dxy=False, use_vol=False, rr=2.0)
+        print(f"    {len(bases['NDS_Fib'])}", flush=True)
+    except Exception as e:
+        traceback.print_exc(); bases["NDS_Fib"] = []
+
+    try:
+        print("  Idris...", flush=True)
+        bases["Idris"] = generate_idris(m1, dxy, use_dxy=False, use_vol=False, rr=3.0)
+        print(f"    {len(bases['Idris'])}", flush=True)
+    except Exception as e:
+        traceback.print_exc(); bases["Idris"] = []
+
+    try:
+        print("  SP2L...", flush=True)
+        bases["SP2L"] = generate_sp2l(m1, dxy, use_dxy=False, use_vol=False, use_htf=False)
+        print(f"    {len(bases['SP2L'])}", flush=True)
+    except Exception as e:
+        traceback.print_exc(); bases["SP2L"] = []
+
+    try:
+        print("  ProBTB...", flush=True)
+        bases["ProBTB"] = generate_pro_btb(m1, dxy, use_dxy=False, use_vol=False, rr=2.0)
+        print(f"    {len(bases['ProBTB'])}", flush=True)
+    except Exception as e:
+        traceback.print_exc(); bases["ProBTB"] = []
+
+    try:
+        print("  MicroMAP...", flush=True)
+        bases["MicroMAP"] = generate_micromap(m1, dxy, use_dxy=False, use_vol=False)
+        print(f"    {len(bases['MicroMAP'])}", flush=True)
+    except Exception as e:
+        traceback.print_exc(); bases["MicroMAP"] = []
+
+    try:
+        print("  AMD core...", flush=True)
+        amd = []
+        for range_mode in ("asian", "m5_lowatr"):
+            for entry_mode in ("market", "limit"):
+                for tp_mode in ("range", "rr2", "rr3"):
+                    for use_htf in (False, True):
+                        amd += generate_amd_po3_ifvg(
+                            m1, dxy, range_mode=range_mode, tf="M5",
+                            entry_mode=entry_mode, tp_mode=tp_mode,
+                            use_htf=use_htf, use_dxy=False, use_vol=False,
+                        )
+        # M1 asian market extras
+        for tp_mode in ("range", "rr2", "rr3"):
+            for use_htf in (False, True):
+                amd += generate_amd_po3_ifvg(
+                    m1, dxy, range_mode="asian", tf="M1", entry_mode="market",
+                    tp_mode=tp_mode, use_htf=use_htf, use_dxy=False, use_vol=False,
+                )
+        bases["AMD_PO3_iFVG"] = amd
+        print(f"    {len(amd)}", flush=True)
+    except Exception as e:
+        traceback.print_exc(); bases["AMD_PO3_iFVG"] = []
+
+    # ---- SL cap skip report ----
+    skip_rows = []
+    for name, ords in bases.items():
+        for cap in CAPS:
+            sk = count_sl_cap_skips(ords, cap)
+            sk["strategy"] = name
+            skip_rows.append(sk)
+            print(f"CAP {name} @{cap}: skip {sk['n_skipped']}/{sk['n_orders']} ({sk['skip_pct']:.1f}%)", flush=True)
+    pd.DataFrame(skip_rows).to_csv(RES / "sl_cap_skips.csv", index=False)
+
+    # ---- Per strategy: IS filter search → OOS judge → WF → MC ----
+    folds = walk_forward_folds(m1, 4)
+    all_stats, all_trades = [], []
+    final_rows = []
+    cause_summary_parts = []
+    spd_rows = []
+    combo_pool = {}
+
+    for name, base in bases.items():
+        print(f"\n=== {name} ===", flush=True)
+        variants = sorted({o.variant for o in base})
+        if not variants:
+            final_rows.append({"strategy": name, "verdict": "DROP", "reason": "هیچ سیگنالی تولید نشد",
+                               "cap": 7.5, "variant": "—", "filter": "—"})
+            continue
+
+        # signals/day baseline (uncapped count of arms)
+        for v in variants[:8]:
+            spd = signals_per_day_stats([o for o in base if o.variant == v])
+            spd_rows.append({"strategy": name, "variant": v, **{k: spd[k] for k in
+                            ("avg", "median", "pct_zero_days", "london_avg", "ny_avg")}})
+
+        best_overall = None  # by OOS expectancy under preferred cap
+        for cap in CAPS:
+            print(f"  cap=${cap} IS filter search...", flush=True)
+            picked = pick_best_filter_is(base, m1_is, dxy, cap, variants)
+            if picked is None:
+                continue
+            _, variant, fname, flags, is_st = picked
+            print(f"    IS pick: {variant} | {fname} n={is_st['n_trades']} R={is_st['expectancy_r']:.3f} PF={is_st['profit_factor']:.2f}", flush=True)
+
+            vo = [o for o in base if o.variant == variant]
+            fo = apply_confirmations(vo, m1, dxy, flags)  # apply on full then period-slice in eval
+
+            # IS + OOS eval
+            for label, part in (("IS", m1_is), ("OOS", m1_oos)):
+                # re-apply confirmations using indicators from full m1 is fine (closed-bar gates)
+                tr, st = eval_set(fo, part, label, cap, dxy_f=flags.get("dxy", False),
+                                  vol_f=flags.get("vol", False), strategy=name, variant=variant)
+                st["filter"] = fname
+                all_stats.append(st)
+                if tr is not None and not tr.empty:
+                    tr["filter"] = fname
+                    all_trades.append(tr)
+
+            # OOS stats
+            _, oos_st = eval_set(fo, m1_oos, "OOS", cap, dxy_f=flags.get("dxy", False),
+                                 vol_f=flags.get("vol", False), strategy=name, variant=variant)
+            oos_st["filter"] = fname
+
+            # Walk-forward: choose nothing new per fold — freeze IS-chosen filter; measure OOS fold R
+            wf_rs = []
+            for is_df, oos_df, wname in folds:
+                # optionally re-pick on fold IS for honesty of stability of THE RULE (frozen)
+                tr, st = eval_set(fo, oos_df, wname, cap, strategy=name, variant=variant)
+                wf_rs.append(st["expectancy_r"] if st["n_trades"] >= 5 else np.nan)
+                st["filter"] = fname
+                st["strategy"] = name
+                st["variant"] = variant
+                all_stats.append(st)
+            wf_valid = [x for x in wf_rs if np.isfinite(x)]
+            wf_pos = float(np.mean([x > 0 for x in wf_valid])) if wf_valid else 0.0
+            print(f"    OOS n={oos_st['n_trades']} R={oos_st['expectancy_r']:.3f} PF={oos_st['profit_factor']:.2f} | WF+={wf_pos:.0%}", flush=True)
+
+            # SL causes on OOS losses
+            tr_oos, _ = eval_set(fo, m1_oos, "OOS", cap, strategy=name, variant=variant)
+            if tr_oos is not None and not tr_oos.empty:
+                try:
+                    clf = classify_losses(tr_oos, m1, dxy)
+                    if not clf.empty:
+                        clf.to_csv(RES / f"sl_causes_{name}_cap{cap}.csv", index=False)
+                        cause_summary_parts.append(clf)
+                except Exception as e:
+                    print("    SL cause err", e)
+
+            # MC if PF>=1.1 and n>=20
+            mc_pass = None
+            mc_df = None
+            if oos_st["profit_factor"] >= 1.1 and oos_st["n_trades"] >= 20 and tr_oos is not None and len(tr_oos) >= 20:
+                mc_df = run_mc(tr_oos["r_multiple"].values, n_sims=4000)
+                if mc_df is not None and not mc_df.empty:
+                    row05 = mc_df[mc_df["risk_pct"] == 0.5]
+                    if not row05.empty:
+                        mc_pass = float(row05.iloc[0]["pass_prob"])
+                    mc_df = mc_df.copy()
+                    mc_df["strategy"] = name
+                    mc_df["variant"] = variant
+                    mc_df["filter"] = fname
+                    mc_df["cap"] = cap
+                    mc_df.to_csv(RES / f"mc_{name}_cap{cap}.csv", index=False)
+
+            verd, reason = verdict_from(oos_st, wf_pos, mc_pass)
+            # signals/day after filters+cap
+            spd = signals_per_day_stats(filter_cap(period_orders(fo, m1_oos.index[0], m1_oos.index[-1]+pd.Timedelta(minutes=1)), cap))
+            rec = {
+                "strategy": name, "cap": cap, "variant": variant, "filter": fname,
+                "flags": json.dumps(flags),
+                "is_n": is_st["n_trades"], "is_r": is_st["expectancy_r"], "is_pf": is_st["profit_factor"],
+                "oos_n": oos_st["n_trades"], "oos_wr": oos_st["win_rate"], "oos_r": oos_st["expectancy_r"],
+                "oos_pf": oos_st["profit_factor"], "oos_dd": oos_st["max_dd_pct"],
+                "oos_tpd": oos_st["trades_per_day"],
+                "spd_avg": spd["avg"], "spd_zero_pct": spd["pct_zero_days"],
+                "wf_pos_frac": wf_pos, "wf_rs": json.dumps([None if not np.isfinite(x) else round(x, 3) for x in wf_rs]),
+                "mc_pass_0.5pct": mc_pass,
+                "verdict": verd, "reason": reason,
+                "skip_pct": count_sl_cap_skips(vo, cap)["skip_pct"],
+            }
+            final_rows.append(rec)
+            print(f"    VERDICT {verd}: {reason}", flush=True)
+
+            score = (oos_st["expectancy_r"] if oos_st["n_trades"] >= 15 else -999,
+                     oos_st["profit_factor"], verd == "KEEP", verd == "MAYBE")
+            if best_overall is None or score > best_overall[0]:
+                best_overall = (score, rec, fo, variant, fname, flags, cap)
+
+        if best_overall and best_overall[1]["verdict"] in ("KEEP", "MAYBE"):
+            combo_pool[name] = filter_cap(
+                apply_confirmations([o for o in base if o.variant == best_overall[3]], m1, dxy, best_overall[5]),
+                best_overall[6],
+            )
+
+    stats_df = pd.DataFrame(all_stats)
+    stats_df.to_csv(RES / "stats_all.csv", index=False)
+    if all_trades:
+        pd.concat(all_trades, ignore_index=True).to_csv(RES / "trades_all.csv", index=False)
+    final_df = pd.DataFrame(final_rows)
+    final_df.to_csv(RES / "final_verdicts.csv", index=False)
+    if spd_rows:
+        (RES / "signals_per_day.json").write_text(json.dumps(spd_rows, indent=2, default=str))
+    if cause_summary_parts:
+        summarize_causes(pd.concat(cause_summary_parts, ignore_index=True)).to_csv(
+            RES / "sl_cause_summary.csv", index=False)
+
+    # ---- Combo of KEEP/MAYBE ----
+    combined_stats = []
+    overlap_df = pd.DataFrame()
+    if combo_pool:
+        print("COMBO...", flush=True)
+        overlap_df = signal_overlap(combo_pool, 30)
+        overlap_df.to_csv(RES / "signal_overlap.csv", index=False)
+        for cap in CAPS:
+            # use each strategy's orders already capped at its chosen cap — re-filter to this cap
+            pool = {k: filter_cap(v, cap) for k, v in combo_pool.items()}
+            combo = build_combined_orders(pool)
+            tr, st = eval_set(combo, m1_oos, "OOS", cap, strategy="COMBO", variant=None)
+            st["variant"] = "merged"
+            st["name"] = f"KEEP_MAYBE_merged_cap{cap}"
+            combined_stats.append(st)
+            if tr is not None and not tr.empty:
+                tr.to_csv(RES / f"combined_oos_cap{cap}.csv", index=False)
+
+    # ---- Write RESULTS.md ----
+    write_results_md(meta, skip_rows, final_df, stats_df, spd_rows, overlap_df, combined_stats)
+    print("DONE", flush=True)
+
+
+def write_results_md(meta, skip_rows, final_df, stats_df, spd_rows, overlap_df, combined_stats):
+    L = []
+    L.append("# نتایج بک‌تست حسابرسی‌شده XAUUSD (موتور واحد)")
+    L.append("")
+    L.append("> closed-bar، ask fill، worst-case SL، اسپرد ۰.۳۵ + اسلیپ ۰.۱۰، تأخیر مارکت ۱ کندل، کپ سخت فاصله SL. اعداد ساختگی نیستند.")
+    L.append("")
+    L.append("## داده و هزینه")
+    L.append(f"- طلا: {meta['xau_source']} — {meta['xau_bars']} M1 از {meta['xau_start']} تا {meta['xau_end']}")
+    L.append(f"- DXY: {meta['dxy_source']} ({meta['dxy_bars']} کندل)")
+    L.append(f"- OOS از {meta['oos_cut']} (~۳۰٪ آخر) | Walk-forward: ۴ فولد روی ۶۰٪ پایانی")
+    L.append(f"- هزینه: spread={meta['costs']['spread']} slip={meta['costs']['slip']} commission={meta['costs']['commission']}/lot")
+    L.append(f"- کپ ریسک: فاصله SL (با اسپرد) ≤ ۵$ (۰.۵٪) یا ≤ ۷.۵$ (۰.۷۵٪)؛ لات = floor(risk$/dist)×۰.۰۱؛ در غیر این صورت سیگنال حذف")
+    L.append("")
+    L.append("## تعریف NDS Fib")
+    L.append("- زون **اصلی**: ۰.۶۲–۰.۷۸ | مقایسه: ۰.۷۸۶–۰.۸۶ | موج M15 ≥۱.۵×ATR | تأیید اینگالفینگ M1")
+    L.append("")
+    L.append("## حذف سیگنال به‌خاطر کپ SL")
+    L.append("| استراتژی | کپ $ | کل سفارش | حذف‌شده | % حذف | باقی‌مانده |")
+    L.append("|---|---:|---:|---:|---:|---:|")
+    for sk in skip_rows:
+        L.append(f"| {sk['strategy']} | {sk['max_sl_dist']} | {sk['n_orders']} | {sk['n_skipped']} | {sk['skip_pct']:.1f}% | {sk['n_kept']} |")
+    L.append("")
+    L.append("## انتخاب فیلتر")
+    L.append("کاندیداها روی **IS** با expectancy انتخاب شدند؛ داوری فقط روی **OOS** و پایداری walk-forward. بدون جستجوی آزاد پارامتر.")
+    L.append("")
+    L.append("## حکم هر ستاپ (برای هر کپ)")
+    if final_df is not None and not final_df.empty:
+        L.append("| ستاپ | کپ | واریانت | فیلتر | OOS n | WR | R | PF | DD% | سیگنال/روز | WF+% | MC pass@0.5% | حکم |")
+        L.append("|---|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|")
+        for _, r in final_df.iterrows():
+            mc = r.get("mc_pass_0.5pct")
+            mc_s = f"{mc*100:.1f}%" if pd.notna(mc) and mc is not None else "—"
+            L.append(
+                f"| {r['strategy']} | {r['cap']} | {r['variant']} | {r['filter']} | "
+                f"{int(r['oos_n'])} | {r['oos_wr']*100:.1f}% | {r['oos_r']:.2f} | {r['oos_pf']:.2f} | "
+                f"{r['oos_dd']:.1f} | {r['spd_avg']:.2f} | {r['wf_pos_frac']*100:.0f}% | {mc_s} | **{r['verdict']}** |"
+            )
+        L.append("")
+        for _, r in final_df.iterrows():
+            L.append(f"- **{r['strategy']} @{r['cap']}$ → {r['verdict']}**: {r['reason']}")
+    L.append("")
+    L.append("## ترکیب KEEP/MAYBE")
+    if combined_stats:
+        for st in combined_stats:
+            L.append(f"- {st.get('name')}: n={st.get('n_trades')}, WR={st.get('win_rate',0)*100:.1f}%, "
+                     f"R={st.get('avg_r',0):.2f}, PF={st.get('profit_factor',0):.2f}, DD={st.get('max_dd_pct',0):.1f}%")
+    else:
+        L.append("- هیچ ستاپ KEEP/MAYBE برای ترکیب باقی نماند.")
+    if overlap_df is not None and not overlap_df.empty:
+        L.append("")
+        L.append("هم‌پوشانی سیگنال (۳۰ دقیقه):")
+        L.append("| " + " | ".join(map(str, overlap_df.columns)) + " |")
+        L.append("|" + "|".join(["---"] * len(overlap_df.columns)) + "|")
+        for _, row in overlap_df.iterrows():
+            L.append("| " + " | ".join(str(row[c]) for c in overlap_df.columns) + " |")
+    L.append("")
+    L.append("## بخش نهایی — قوانین بهینه‌شده و توصیه")
+    L.append("")
+    if final_df is None or final_df.empty:
+        L.append("نتیجه‌ای برای خلاصه نهایی موجود نیست.")
+    else:
+        # prefer cap 5 then 7.5 for display of kept
+        keeps = final_df[final_df["verdict"] == "KEEP"]
+        maybes = final_df[final_df["verdict"] == "MAYBE"]
+        drops = final_df[final_df["verdict"] == "DROP"]
+        L.append("### KEEP")
+        if keeps.empty:
+            L.append("_هیچ ستآپی با لبه OOS پایدار و قابل‌اتکا طبق معیارهای سخت پیدا نشد._")
+        else:
+            for _, r in keeps.iterrows():
+                L.append(f"#### {r['strategy']} (کپ {r['cap']}$)")
+                L.append(f"- قوانین نهایی: واریانت `{r['variant']}` + فیلتر `{r['filter']}` ({r['flags']})")
+                L.append(f"- OOS: n={int(r['oos_n'])}, WR={r['oos_wr']*100:.1f}%, R={r['oos_r']:.2f}, PF={r['oos_pf']:.2f}, MaxDD={r['oos_dd']:.1f}%")
+                L.append(f"- سیگنال/روز≈{r['spd_avg']:.2f} | روز صفر≈{r['spd_zero_pct']:.0f}% | WF مثبت={r['wf_pos_frac']*100:.0f}%")
+                mc = r.get("mc_pass_0.5pct")
+                L.append(f"- MC عبور چالش SGB @0.5% ریسک: {mc*100:.1f}%" if pd.notna(mc) and mc is not None else "- MC: اجرا نشد یا زیر آستانه")
+        L.append("")
+        L.append("### MAYBE")
+        if maybes.empty:
+            L.append("_—_")
+        else:
+            for _, r in maybes.iterrows():
+                L.append(f"- **{r['strategy']} @{r['cap']}$** / `{r['variant']}` / `{r['filter']}`: "
+                         f"OOS R={r['oos_r']:.2f} PF={r['oos_pf']:.2f} n={int(r['oos_n'])} — {r['reason']}")
+        L.append("")
+        L.append("### DROP")
+        for strat, g in drops.groupby("strategy"):
+            reasons = g["reason"].iloc[0]
+            L.append(f"- **{strat}**: {reasons}")
+        L.append("")
+        L.append("### توصیه ترکیب و واتچ‌داگ")
+        if not keeps.empty:
+            L.append("- فقط ستاپ‌های KEEP را با اولویت زمان سیگنال ادغام کنید (یک پوزیشن همزمان؛ فاصله ۵ دقیقه).")
+            L.append("- در واتچ‌داگ: همان کپ سخت SL — اگر dist(entry,SL)+spread > کپ حساب، سیگنال را نشان ندهید.")
+        else:
+            L.append("- فعلاً **هیچ پورتفوی KEEP توصیه‌ای نیست**. بهینه‌سازی بیشتر روی قوانین ورود لازم است؛ با این دوره و قوانین حسابرسی‌شده لبه قوی دیده نشد.")
+        L.append("- کپ ۰.۵٪ ($۵) را پیش‌فرض چالش SGB بگذارید؛ ۰.۷۵٪ فقط اگر ستاپ KEEP با نمونه کافی فقط زیر ۷.۵$ زنده بماند.")
+        L.append("")
+        L.append("### صداقت")
+        L.append("- DXY مصنوعی است؛ تیک‌والیوم پروکسی اردرفلو است نه خود آن.")
+        L.append("- اگر همه DROP/MAYBE هستند، یعنی برای حساب ۱۰۰۰$ با کپ فاصله SL واقعی، این ستاپ‌ها در نمونه ۲۰۲۵-۱۰→۲۰۲۶-۱۰ لبه پایدار نشان ندادند.")
+    (ROOT / "RESULTS.md").write_text("\n".join(L), encoding="utf-8")
+    print("Wrote RESULTS.md", flush=True)
+
+
+if __name__ == "__main__":
+    main()
+"""Monte Carlo simulation of SGB Class B challenge from a pool of trade R-multiples."""
+from __future__ import annotations
+import numpy as np
+import pandas as pd
+
+
+def run_mc(
+    r_multiples: np.ndarray,
+    *,
+    n_sims: int = 5000,
+    initial: float = 1000.0,
+    risk_pcts=(0.005, 0.01, 0.015),
+    target: float = 0.10,       # phase 1
+    daily_dd: float = 0.05,
+    max_dd: float = 0.12,
+    circuit_2loss: bool = True,
+    max_trades_per_sim: int = 400,
+    seed: int = 42,
+) -> pd.DataFrame:
+    rng = np.random.default_rng(seed)
+    r = np.asarray(r_multiples, dtype=float)
+    r = r[np.isfinite(r)]
+    if len(r) < 10:
+        return pd.DataFrame()
+
+    rows = []
+    for risk in risk_pcts:
+        passes = busts = 0
+        days_list = []
+        for _ in range(n_sims):
+            bal = initial
+            peak_ref = initial  # static max DD from initial
+            day_bal = initial
+            cons_loss = 0
+            trades_today = 0
+            day = 0
+            outcome = "timeout"
+            for t in range(max_trades_per_sim):
+                # new day every ~3 trades (rough) — or random 1-4 trades/day
+                if trades_today == 0:
+                    day += 1
+                    day_bal = bal
+                    cons_loss = 0
+                    day_cap = int(rng.integers(1, 4))
+                # circuit breaker personal rule
+                if circuit_2loss and cons_loss >= 2:
+                    # skip rest of day
+                    trades_today = day_cap
+                    if trades_today >= day_cap:
+                        trades_today = 0
+                    continue
+                # personal 1% daily stop
+                if (day_bal - bal) / day_bal >= 0.01:
+                    trades_today = 0
+                    continue
+
+                rr = r[int(rng.integers(0, len(r)))]
+                pnl = bal * risk * rr
+                bal += pnl
+                if pnl < 0:
+                    cons_loss += 1
+                else:
+                    cons_loss = 0
+                trades_today += 1
+                if trades_today >= day_cap:
+                    trades_today = 0
+
+                # SGB rules
+                if bal <= initial * (1 - max_dd):
+                    outcome = "bust"
+                    busts += 1
+                    break
+                # daily DD from start-of-day (approx with equity=balance since flat between trades)
+                if (day_bal - bal) / day_bal >= daily_dd:
+                    outcome = "bust"
+                    busts += 1
+                    break
+                if bal >= initial * (1 + target):
+                    outcome = "pass"
+                    passes += 1
+                    days_list.append(day)
+                    break
+            else:
+                outcome = "timeout"
+
+        rows.append({
+            "risk_pct": risk * 100,
+            "n_sims": n_sims,
+            "pass_prob": passes / n_sims,
+            "bust_prob": busts / n_sims,
+            "timeout_prob": 1 - (passes + busts) / n_sims,
+            "median_days_to_pass": float(np.median(days_list)) if days_list else None,
+            "n_r_pool": len(r),
+        })
+    return pd.DataFrame(rows)
+"""Closed-bar-safe helpers."""
+from __future__ import annotations
+import numpy as np
+import pandas as pd
+
+
+def resample_ohlc(df: pd.DataFrame, rule: str) -> pd.DataFrame:
+    """Left-labeled bars: index = period start; bar closes at start+rule."""
+    agg = {"open": "first", "high": "max", "low": "min", "close": "last"}
+    if "volume" in df.columns:
+        agg["volume"] = "sum"
+    out = df.resample(rule, label="left", closed="left").agg(agg).dropna(subset=["open", "high", "low", "close"])
+    return out
+
+
+def bar_end(ts: pd.Timestamp, rule_minutes: int) -> pd.Timestamp:
+    return ts + pd.Timedelta(minutes=rule_minutes)
+
+
+def atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
+    h, l, c = df["high"], df["low"], df["close"]
+    prev = c.shift(1)
+    tr = pd.concat([(h - l), (h - prev).abs(), (l - prev).abs()], axis=1).max(axis=1)
+    return tr.rolling(n, min_periods=n).mean()
+
+
+def atr_prior(df: pd.DataFrame, n: int = 14) -> pd.Series:
+    """ATR known at bar i using data through i-1 (prior-bar ATR)."""
+    return atr(df, n).shift(1)
+
+
+def ema(s: pd.Series, n: int) -> pd.Series:
+    return s.ewm(span=n, adjust=False).mean()
+
+
+def rsi(close: pd.Series, n: int = 14) -> pd.Series:
+    d = close.diff()
+    up = d.clip(lower=0)
+    dn = -d.clip(upper=0)
+    au = up.ewm(alpha=1 / n, adjust=False).mean()
+    ad = dn.ewm(alpha=1 / n, adjust=False).mean()
+    rs = au / ad.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
+
+
+def body(df: pd.DataFrame) -> pd.Series:
+    return (df["close"] - df["open"]).abs()
+
+
+def is_bull(df: pd.DataFrame) -> pd.Series:
+    return df["close"] > df["open"]
+
+
+def is_bear(df: pd.DataFrame) -> pd.Series:
+    return df["close"] < df["open"]
+
+
+def bullish_engulfing(df: pd.DataFrame) -> pd.Series:
+    prev_bear = is_bear(df).shift(1)
+    curr_bull = is_bull(df)
+    eng = (df["open"] <= df["close"].shift(1)) & (df["close"] >= df["open"].shift(1))
+    return prev_bear.fillna(False) & curr_bull & eng.fillna(False)
+
+
+def bearish_engulfing(df: pd.DataFrame) -> pd.Series:
+    prev_bull = is_bull(df).shift(1)
+    curr_bear = is_bear(df)
+    eng = (df["open"] >= df["close"].shift(1)) & (df["close"] <= df["open"].shift(1))
+    return prev_bull.fillna(False) & curr_bear & eng.fillna(False)
+
+
+def inside_bar(df: pd.DataFrame) -> pd.Series:
+    return (df["high"] < df["high"].shift(1)) & (df["low"] > df["low"].shift(1))
+
+
+def pivot_confirmed(high: pd.Series, low: pd.Series, left: int = 5, right: int = 5):
+    """At confirmation bar conf=i+right, pivot bar is i. Arrays indexed by conf bar."""
+    n = len(high)
+    ph_bar = np.full(n, -1, dtype=int)
+    pl_bar = np.full(n, -1, dtype=int)
+    ph_px = np.full(n, np.nan)
+    pl_px = np.full(n, np.nan)
+    hv, lv = high.values, low.values
+    for i in range(left, n - right):
+        w = hv[i - left : i + right + 1]
+        if hv[i] == w.max() and (w == hv[i]).sum() == 1:
+            conf = i + right
+            ph_bar[conf] = i
+            ph_px[conf] = hv[i]
+        w = lv[i - left : i + right + 1]
+        if lv[i] == w.min() and (w == lv[i]).sum() == 1:
+            conf = i + right
+            pl_bar[conf] = i
+            pl_px[conf] = lv[i]
+    return ph_bar, pl_bar, ph_px, pl_px
+
+
+def vol_ma(volume: pd.Series, n: int = 20) -> pd.Series:
+    return volume.rolling(n, min_periods=n).mean()
+
+
+def in_session(ts: pd.Timestamp) -> bool:
+    h = ts.hour
+    dow = getattr(ts, "day_of_week", ts.dayofweek)
+    return ((7 <= h < 16) or (12 <= h < 21)) and dow < 5
+
+
+
+
+def macd(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
+    """Return (macd_line, signal_line, hist)."""
+    ef = close.ewm(span=fast, adjust=False).mean()
+    es = close.ewm(span=slow, adjust=False).mean()
+    line = ef - es
+    sig = line.ewm(span=signal, adjust=False).mean()
+    hist = line - sig
+    return line, sig, hist
+
+
+def stoch(high: pd.Series, low: pd.Series, close: pd.Series,
+          k: int = 14, d: int = 3, smooth: int = 3):
+    """Stochastic %K (smoothed) and %D. Returns (k_line, d_line)."""
+    lowest = low.rolling(k, min_periods=k).min()
+    highest = high.rolling(k, min_periods=k).max()
+    raw_k = 100 * (close - lowest) / (highest - lowest).replace(0, np.nan)
+    k_line = raw_k.rolling(smooth, min_periods=smooth).mean()
+    d_line = k_line.rolling(d, min_periods=d).mean()
+    return k_line, d_line
+
+
+def in_tokyo_london(ts: pd.Timestamp) -> bool:
+    """UTC Tokyo(~00-09) + London(~07-16) → 00-16 weekdays."""
+    h = ts.hour
+    dow = getattr(ts, "day_of_week", ts.dayofweek)
+    return dow < 5 and (0 <= h < 16)
+
+
+def last_closed_value(series: pd.Series, t: pd.Timestamp, bar_minutes: int):
+    """Last bar whose period END <= t. Left-labeled → start <= t - bar_minutes."""
+    deadline = t - pd.Timedelta(minutes=bar_minutes)
+    j = series.index.searchsorted(deadline, side="right") - 1
+    if j < 0:
+        return None
+    return float(series.iloc[j])

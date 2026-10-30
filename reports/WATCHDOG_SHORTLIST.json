@@ -1,0 +1,68 @@
+{
+  "mode": "signal_only_manual_execution",
+  "symbol": "XAUUSD.X",
+  "frequency_policy": "3_per_day_MINIMUM_not_cap",
+  "primary_feed": "swissquote_bbo_poll_5_10s",
+  "fallback_feed": "gold_api",
+  "dollar_proxy": "swissquote_EURUSD_inverse",
+  "stale_suppress": true,
+  "components_all_rigor": [
+    {
+      "base": "F3_nds_M5_sym",
+      "overlay": "atr_regime",
+      "tpd": 0.6941176470588235,
+      "OOS_R": 0.1508786495408564
+    },
+    {
+      "base": "F3_nds_M5_sym",
+      "overlay": "dxy_align",
+      "tpd": 0.2470588235294117,
+      "OOS_R": 0.682154054736425
+    },
+    {
+      "base": "F3_nds_M5_sym",
+      "overlay": "mh30s",
+      "tpd": 0.7058823529411765,
+      "OOS_R": 0.1290844234482796
+    },
+    {
+      "base": "F3_nds_M5_sym",
+      "overlay": "none",
+      "tpd": 0.7058823529411765,
+      "OOS_R": 0.1290844234482796
+    },
+    {
+      "base": "F7_spike3d_c22d_or",
+      "overlay": "atr_regime",
+      "tpd": 0.9411764705882352,
+      "OOS_R": 0.3023783751960076
+    },
+    {
+      "base": "F7_spike3d_c22d_or",
+      "overlay": "mh30s",
+      "tpd": 0.9647058823529412,
+      "OOS_R": 0.2731399876086135
+    },
+    {
+      "base": "F7_spike3d_c22d_or",
+      "overlay": "none",
+      "tpd": 0.9647058823529412,
+      "OOS_R": 0.2731399876086135
+    },
+    {
+      "base": "brk_M5_M1_rr1.5_k1",
+      "overlay": "sess_overlap+dxy",
+      "tpd": 0.3294117647058823,
+      "OOS_R": 0.1979917949200198
+    },
+    {
+      "base": "liqraid_pdh_pdl_rr1.5_kzany",
+      "overlay": "ex_partial_be",
+      "tpd": 0.4352941176470588,
+      "OOS_R": 0.1333813668076853
+    }
+  ],
+  "max_union_tpd_dedup5m": 2.011764705882353,
+  "max_union_below_minimum": true,
+  "dedupe": "same_side_overlap_only_for_concurrent_risk"
+}

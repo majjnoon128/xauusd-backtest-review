@@ -1,0 +1,506 @@
+"""Signal-only SGB watchdog helpers (no order placement)."""
+"""Format signal-only alert text for Bale/Telegram (≤4096 chars). No network send."""
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Optional
+
+
+@dataclass
+class AlertPayload:
+    side: str
+    entry: float
+    sl: float
+    tp: Optional[float]
+    lots: float
+    risk_usd: float
+    strategy: str
+    dollar_proxy: str = "EURUSD_inv"
+    hold_note: str = "Hold winners ≥30s (tick-scalp cap)"
+
+
+def format_alert(p: AlertPayload) -> str:
+    tp = f"{p.tp:.2f}" if p.tp is not None else "—"
+    text = (
+        f"🔔 XAUUSD.X SIGNAL (MANUAL ONLY)\n"
+        f"{p.side.upper()} @ {p.entry:.2f}\n"
+        f"SL {p.sl:.2f} | TP {tp}\n"
+        f"Lots {p.lots:.2f} | Risk ${p.risk_usd:.2f}\n"
+        f"Setup: {p.strategy}\n"
+        f"Dollar gate: {p.dollar_proxy}\n"
+        f"{p.hold_note}\n"
+        f"⛔ Do not EA-send — execute in MT5 manually"
+    )
+    if len(text) > 4096:
+        text = text[:4090] + "…"
+    return text
+"""Signal-only alerter stub — NEVER places orders (SGB EA ban).
+
+Loop (live, future wiring):
+1. Load promoted union/components from WATCHDOG_SPEC_FINAL shortlist
+2. On new closed M5/M1 bar, generate candidate orders
+3. Run advise_signal(...) gates
+4. If ok: push alert (Telegram/Slack/UI) with side, entry, SL, TP, lots, risk$
+5. Operator executes manually in MT5; watchdog only tracks fills the operator confirms
+
+This module is intentionally incomplete for brokerage I/O.
+"""
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Optional
+from .gates import AccountState, OpenRisk, GateResult, advise_signal, MIN_HOLD_SECONDS
+
+
+@dataclass
+class ManualAlert:
+    side: str
+    entry: float
+    sl: float
+    tp: Optional[float]
+    lots: float
+    risk_usd: float
+    strategy: str
+    note: str = "MANUAL EXECUTION REQUIRED — do not EA-send"
+
+
+def build_alert(
+    state: AccountState,
+    open_risks: list,
+    side: str,
+    entry: float,
+    sl: float,
+    tp: Optional[float],
+    strategy: str,
+    spread: float,
+    risk_budget: float = 8.0,
+    contract_oz: float = 100.0,
+) -> tuple[Optional[ManualAlert], GateResult]:
+    sl_dist = abs(entry - sl)
+    gate = advise_signal(state, open_risks, sl_dist, spread, risk_budget, contract_oz=contract_oz)
+    if not gate.ok:
+        return None, gate
+    alert = ManualAlert(
+        side=side, entry=entry, sl=sl, tp=tp, lots=gate.lots,
+        risk_usd=gate.risk_usd, strategy=strategy,
+        note=f"MANUAL EXECUTION REQUIRED; prefer hold winners ≥{MIN_HOLD_SECONDS}s",
+    )
+    return alert, gate
+"""Dollar strength proxy for live watchdog when raw DXY is unavailable.
+
+Live: use EURUSD (MT5 / Finnhub / Twelve / yfinance EURUSD=X) inverted.
+Do NOT use Yahoo DX-Y.NYB or GC=F (≈30 min delay per Yahoo delay table).
+Research parity: data/EURUSD.parquet → 1/close as DXY-like series.
+"""
+from __future__ import annotations
+from pathlib import Path
+import pandas as pd
+
+DATA = Path(__file__).resolve().parents[2] / "data"
+
+
+def eurusd_to_dxy_like(eur: pd.DataFrame) -> pd.DataFrame:
+    """Return DataFrame with close=1/EURUSD.close (optional OHLC inverted)."""
+    if eur.index.tz is None:
+        eur = eur.copy()
+        eur.index = eur.index.tz_localize("UTC")
+    close = eur["close"].astype(float)
+    out = (1.0 / close).to_frame("close")
+    if all(c in eur.columns for c in ("open", "high", "low")):
+        out["open"] = 1.0 / eur["open"].astype(float)
+        out["high"] = 1.0 / eur["low"].astype(float)
+        out["low"] = 1.0 / eur["high"].astype(float)
+    return out
+
+
+def load_research_proxy(prefer: str = "EURUSD_inv") -> tuple[pd.DataFrame, str]:
+    """Load dollar series for gating. prefer: EURUSD_inv | DXY_synth."""
+    if prefer == "DXY_synth":
+        dxy = pd.read_parquet(DATA / "DXY_synth.parquet")
+        if dxy.index.tz is None:
+            dxy.index = dxy.index.tz_localize("UTC")
+        if "close" not in dxy.columns:
+            dxy = dxy.rename(columns={dxy.columns[0]: "close"})
+        return dxy, "DXY_synth"
+    eur = pd.read_parquet(DATA / "EURUSD.parquet")
+    return eurusd_to_dxy_like(eur), "EURUSD_inv"
+"""SGB Plan A risk gates for signal-only watchdog (manual execution).
+No order placement — size/check/alert only. Compliant with EA/VPS ban.
+"""
+from __future__ import annotations
+from dataclasses import dataclass, field
+from typing import List, Optional
+import math
+
+
+CONTRACT_OZ_DEFAULT = 100.0  # VERIFY in MT5 Specification before live
+LOT_STEP = 0.01
+TICK_SCALP_MAX_FRAC = 0.20  # of phase target
+PHASE1_TARGET_FRAC = 0.08
+DAILY_LOSS_FRAC = 0.05
+MAX_LOSS_FRAC = 0.12
+CONCURRENT_RISK_FRAC = 0.03
+MIN_HOLD_SECONDS = 30
+
+
+@dataclass
+class AccountState:
+    start_balance: float = 1000.0
+    sod_balance: float = 1000.0  # balance at server midnight (~03:30 Tehran)
+    live_balance: float = 1000.0
+    live_equity: float = 1000.0
+    tick_scalp_pnl: float = 0.0  # sum of winners closed <30s
+    phase: int = 1  # 1 or 2
+    consec_losses: int = 0
+    day_dd_pct: float = 0.0  # (sod - equity)/sod * 100 if under
+
+
+@dataclass
+class OpenRisk:
+    planned_risk_usd: float
+    side: str
+    sl_distance: float
+    lots: float
+
+
+@dataclass
+class GateResult:
+    ok: bool
+    reason: str = ""
+    lots: float = 0.0
+    risk_usd: float = 0.0
+
+
+def lots_for_risk(
+    risk_usd: float,
+    sl_distance: float,
+    spread: float,
+    commission_price_equiv: float = 0.0,
+    contract_oz: float = CONTRACT_OZ_DEFAULT,
+    lot_step: float = LOT_STEP,
+) -> float:
+    """lots = floor( risk$ / ((SL + spread + commission) * contract_oz) ) to lot_step.
+
+    commission_price_equiv: commission expressed as equivalent price distance ($),
+    e.g. RT_$per_lot / contract_oz for the sized trade is circular — prefer:
+      denom = (sl + spread) * contract_oz; lots_raw = risk / denom;
+      then subtract commission_rt * lots_raw from risk and re-solve once.
+    Steering one-liner assumes commission already in price-equivalent dollars.
+    """
+    denom = (sl_distance + spread + commission_price_equiv) * contract_oz
+    if denom <= 0 or risk_usd <= 0:
+        return 0.0
+    raw = risk_usd / denom
+    # floor to step
+    lots = math.floor(raw / lot_step + 1e-12) * lot_step
+    return max(0.0, lots)
+
+
+def check_daily_loss(state: AccountState) -> GateResult:
+    floor = state.sod_balance * (1.0 - DAILY_LOSS_FRAC)
+    # Official: breach on balance OR equity (even slippage)
+    if state.live_balance <= floor or state.live_equity <= floor:
+        return GateResult(False, f"daily_loss: bal/eq at or below SOD*0.95={floor:.2f}")
+    return GateResult(True, "daily_ok")
+
+
+def check_max_loss(state: AccountState) -> GateResult:
+    floor = state.start_balance * (1.0 - MAX_LOSS_FRAC)
+    if state.live_balance <= floor or state.live_equity <= floor:
+        return GateResult(False, f"max_loss: bal/eq at or below static floor={floor:.2f}")
+    return GateResult(True, "max_ok")
+
+
+def check_concurrent(
+    state: AccountState,
+    open_risks: List[OpenRisk],
+    new_risk_usd: float,
+) -> GateResult:
+    cap = CONCURRENT_RISK_FRAC * state.live_balance
+    total = sum(r.planned_risk_usd for r in open_risks) + new_risk_usd
+    if total > cap + 1e-9:
+        return GateResult(False, f"concurrent_risk: {total:.2f} > 3% of live={cap:.2f}")
+    return GateResult(True, "concurrent_ok", risk_usd=new_risk_usd)
+
+
+def check_tick_scalp_cap(state: AccountState) -> GateResult:
+    target = state.start_balance * (PHASE1_TARGET_FRAC if state.phase == 1 else 0.04)
+    cap = TICK_SCALP_MAX_FRAC * target
+    if state.tick_scalp_pnl >= cap:
+        return GateResult(False, f"tick_scalp_cap: {state.tick_scalp_pnl:.2f} >= 20% target={cap:.2f}")
+    return GateResult(True, "tick_ok")
+
+
+def check_soft_cb(state: AccountState) -> GateResult:
+    if state.consec_losses >= 2:
+        return GateResult(False, "soft_cb: 2 consecutive losses")
+    if state.day_dd_pct >= 1.0:
+        return GateResult(False, "soft_cb: 1% daily DD")
+    return GateResult(True, "soft_ok")
+
+
+def advise_signal(
+    state: AccountState,
+    open_risks: List[OpenRisk],
+    sl_distance: float,
+    spread: float,
+    risk_budget: float = 8.0,
+    commission_price_equiv: float = 0.0,
+    contract_oz: float = CONTRACT_OZ_DEFAULT,
+    feed_ok: bool = True,
+    feed_reason: str = "ok",
+) -> GateResult:
+    """All gates before emitting a manual-execution alert. Never places orders."""
+    if not feed_ok:
+        return GateResult(False, f"stale_or_bad_feed: {feed_reason}")
+    for fn in (check_max_loss, check_daily_loss, check_tick_scalp_cap, check_soft_cb):
+        r = fn(state)
+        if not r.ok:
+            return r
+    lots = lots_for_risk(risk_budget, sl_distance, spread, commission_price_equiv, contract_oz)
+    if lots < LOT_STEP - 1e-12:
+        # Granularity: e.g. SL=8 + spread=0.30 → theoretical <0.01.
+        # Surface min-lot risk for operator choice — still no auto-place.
+        min_risk = LOT_STEP * (sl_distance + spread + commission_price_equiv) * contract_oz
+        return GateResult(
+            False,
+            f"lots_below_min_step: need risk≥{min_risk:.2f} for 0.01 lot incl. costs; "
+            f"or tighten SL. Operator may manually accept 0.01 if min_risk ≤ 3% concurrent.",
+            lots=0.0,
+            risk_usd=min_risk,
+        )
+    # actual risk at floored lots (price component only; spread already in sizing)
+    actual_risk = lots * (sl_distance + spread + commission_price_equiv) * contract_oz
+    r = check_concurrent(state, open_risks, actual_risk)
+    if not r.ok:
+        return r
+    return GateResult(True, "emit_manual_alert", lots=lots, risk_usd=actual_risk)
+
+
+def note_winner_hold_seconds(hold_s: float, pnl: float, state: AccountState) -> AccountState:
+    """Call after a closed winner. If hold < 30s, add to tick-scalp PnL."""
+    if pnl > 0 and hold_s < MIN_HOLD_SECONDS:
+        state.tick_scalp_pnl += pnl
+    return state
+"""Live price feeds for signal-only watchdog (batch-8/9).
+
+Primary: Swissquote public BBO — poll gently every 5–10s to build M1 bars.
+  XAU/USD + EUR/USD (dollar proxy = 1/EUR mid).
+Fallback: gold-api.com /price/XAU (~tens of seconds lag, no WS).
+Stale-feed check suppresses new signals when quotes age out.
+
+Undocumented SQ rate limit/ToS — do not hammer. PAXG/XAUT unsuitable for $8 SL.
+"""
+from __future__ import annotations
+import json, time, urllib.request
+from dataclasses import dataclass, field
+from typing import Optional, Dict, List
+from pathlib import Path
+import pandas as pd
+
+UA = {"User-Agent": "GrokBotWatchdog/1.0"}
+SQ_BASE = "https://forex-data-feed.swissquote.com/public-quotes/bboquotes/instrument"
+GA_URL = "https://api.gold-api.com/price/XAU"
+
+# Stale thresholds (seconds) — suppress signals if last good quote older
+STALE_XAU_SEC = 30.0       # SQ should refresh every 5–10s; 30s = stale
+STALE_EUR_SEC = 30.0
+STALE_GA_FALLBACK_SEC = 90.0  # gold-api slower cadence
+
+
+@dataclass
+class Quote:
+    source: str
+    instrument: str
+    bid: Optional[float]
+    ask: Optional[float]
+    mid: float
+    ts_ms: Optional[int]
+    recv_mono: float
+    rtt_s: float
+    profile: str = ""
+
+
+@dataclass
+class FeedHealth:
+    ok: bool
+    reason: str
+    xau_age_s: Optional[float] = None
+    eur_age_s: Optional[float] = None
+    using_fallback: bool = False
+
+
+def _http_get(url: str, timeout: float = 8.0) -> tuple[bytes, float]:
+    t0 = time.time()
+    req = urllib.request.Request(url, headers=UA)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read(), time.time() - t0
+
+
+def _parse_sq(body: bytes, instrument: str, rtt: float) -> Quote:
+    data = json.loads(body)
+    items = data if isinstance(data, list) else [data]
+    best = None
+    for it in items:
+        ts = it.get("ts")
+        for p in it.get("spreadProfilePrices") or []:
+            bid, ask = p.get("bid"), p.get("ask")
+            if bid is None or ask is None:
+                continue
+            bid, ask = float(bid), float(ask)
+            mid = (bid + ask) / 2.0
+            prof = p.get("spreadProfile") or ""
+            score = 0 if prof == "premium" else (1 if prof == "standard" else 2)
+            cand = (score, bid, ask, mid, ts, prof)
+            if best is None or cand[0] < best[0]:
+                best = cand
+    if best is None:
+        raise RuntimeError(f"SQ {instrument}: no bid/ask")
+    _, bid, ask, mid, ts, prof = best
+    return Quote("swissquote_bbo", instrument, bid, ask, mid,
+                 int(ts) if ts else None, time.monotonic(), rtt, prof)
+
+
+def fetch_swissquote(instrument: str = "XAU/USD") -> Quote:
+    body, rtt = _http_get(f"{SQ_BASE}/{instrument}")
+    return _parse_sq(body, instrument, rtt)
+
+
+def fetch_gold_api_xau() -> Quote:
+    body, rtt = _http_get(GA_URL)
+    d = json.loads(body)
+    return Quote("gold_api", "XAU/USD", None, None, float(d["price"]),
+                 None, time.monotonic(), rtt, d.get("updatedAt", ""))
+
+
+class LiveFeed:
+    """Gentle poller: SQ XAU+EUR every poll_sec; gold-api fallback for XAU; M1 OHLC builder."""
+
+    def __init__(self, poll_sec: float = 8.0, m1_path: Optional[Path] = None):
+        self.poll_sec = max(5.0, min(10.0, float(poll_sec)))
+        self.last_xau: Optional[Quote] = None
+        self.last_eur: Optional[Quote] = None
+        self.using_ga = False
+        self._m1_ticks: List[tuple] = []  # (recv_wall, mid)
+        self._m1_bars: List[dict] = []
+        self.m1_path = m1_path
+        self._last_poll_mono = 0.0
+
+    def poll_once(self) -> FeedHealth:
+        """One gentle cycle: XAU then EUR from SQ; GA only if XAU SQ fails."""
+        now = time.monotonic()
+        # XAU
+        try:
+            self.last_xau = fetch_swissquote("XAU/USD")
+            self.using_ga = False
+        except Exception as e_sq:
+            try:
+                self.last_xau = fetch_gold_api_xau()
+                self.using_ga = True
+            except Exception as e_ga:
+                return FeedHealth(False, f"xau_fetch_fail SQ={e_sq}; GA={e_ga}", using_fallback=True)
+        # EUR for DXY proxy
+        try:
+            self.last_eur = fetch_swissquote("EUR/USD")
+        except Exception as e:
+            # EUR fail alone: still may trade if we allow, but dollar gate stale
+            pass
+        # record tick for M1
+        if self.last_xau is not None:
+            wall = time.time()
+            self._m1_ticks.append((wall, self.last_xau.mid))
+            self._rollup_m1(wall)
+        self._last_poll_mono = now
+        return self.health()
+
+    def _rollup_m1(self, wall: float) -> None:
+        """Build closed M1 bars from mid ticks (second-precision floor)."""
+        if not self._m1_ticks:
+            return
+        # group by UTC minute
+        by_min: Dict[int, List[float]] = {}
+        for w, mid in self._m1_ticks:
+            mkey = int(w) // 60
+            by_min.setdefault(mkey, []).append(mid)
+        cur = int(wall) // 60
+        # emit fully closed minutes (< current)
+        existing = {b["minute"] for b in self._m1_bars}
+        for mkey, mids in sorted(by_min.items()):
+            if mkey >= cur or mkey in existing:
+                continue
+            self._m1_bars.append({
+                "minute": mkey,
+                "time": pd.Timestamp(mkey * 60, unit="s", tz="UTC"),
+                "open": mids[0], "high": max(mids), "low": min(mids), "close": mids[-1],
+                "n_ticks": len(mids),
+            })
+        # trim tick buffer to last 3 minutes
+        cutoff = wall - 180
+        self._m1_ticks = [(w, m) for w, m in self._m1_ticks if w >= cutoff]
+        if self.m1_path and self._m1_bars:
+            self.m1_path.parent.mkdir(parents=True, exist_ok=True)
+            pd.DataFrame(self._m1_bars).to_csv(self.m1_path, index=False)
+
+    def m1_dataframe(self) -> pd.DataFrame:
+        if not self._m1_bars:
+            return pd.DataFrame(columns=["open", "high", "low", "close"])
+        df = pd.DataFrame(self._m1_bars).set_index("time")[["open", "high", "low", "close"]]
+        return df
+
+    def eurusd_inv_mid(self) -> Optional[float]:
+        if self.last_eur is None or self.last_eur.mid <= 0:
+            return None
+        return 1.0 / self.last_eur.mid
+
+    def health(self) -> FeedHealth:
+        now = time.monotonic()
+        if self.last_xau is None:
+            return FeedHealth(False, "no_xau_quote")
+        xau_age = now - self.last_xau.recv_mono
+        lim = STALE_GA_FALLBACK_SEC if self.using_ga else STALE_XAU_SEC
+        if xau_age > lim:
+            return FeedHealth(False, f"xau_stale age={xau_age:.1f}s>{lim}", xau_age_s=xau_age,
+                              using_fallback=self.using_ga)
+        eur_age = None
+        if self.last_eur is not None:
+            eur_age = now - self.last_eur.recv_mono
+            if eur_age > STALE_EUR_SEC:
+                return FeedHealth(False, f"eur_stale age={eur_age:.1f}s>{STALE_EUR_SEC}",
+                                  xau_age_s=xau_age, eur_age_s=eur_age, using_fallback=self.using_ga)
+        else:
+            return FeedHealth(False, "no_eur_quote_dollar_gate", xau_age_s=xau_age,
+                              using_fallback=self.using_ga)
+        return FeedHealth(True, "ok", xau_age_s=xau_age, eur_age_s=eur_age,
+                          using_fallback=self.using_ga)
+
+
+def feed_allows_signals(feed: LiveFeed) -> FeedHealth:
+    """Gate: suppress new signals when feed unhealthy/stale."""
+    return feed.health()
+"""Refresh FF weekly calendar with local cache + rate-limit guard."""
+from __future__ import annotations
+import json, time, urllib.request
+from pathlib import Path
+
+URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+CACHE = Path(__file__).resolve().parents[2] / "data" / "calendar" / "ff_thisweek.json"
+META = CACHE.with_suffix(".meta.json")
+MIN_REFRESH_SEC = 30 * 60  # 30 min
+
+
+def refresh(force: bool = False) -> Path:
+    CACHE.parent.mkdir(parents=True, exist_ok=True)
+    now = time.time()
+    if META.exists() and not force:
+        meta = json.loads(META.read_text())
+        if now - meta.get("fetched_at", 0) < MIN_REFRESH_SEC:
+            return CACHE
+    req = urllib.request.Request(URL, headers={"User-Agent": "GrokBotWatchdog/1.0"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        raw = r.read()
+    CACHE.write_bytes(raw)
+    META.write_text(json.dumps({"fetched_at": now, "bytes": len(raw), "url": URL}, indent=2))
+    return CACHE
+
+
+if __name__ == "__main__":
+    p = refresh()
+    print("cached", p, "n", len(json.loads(p.read_text())))

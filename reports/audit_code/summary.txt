@@ -1,0 +1,15 @@
+CODE AUDIT SUMMARY
+BUGS_FLAGGED=6
+BUG: [SP2L] P-Gap/FVG is WAIVED when body move > 1.5*ATR (has_fvg=True without gap). Official: 'No gap means invalid'.
+BUG: [SP2L] Variant B (buy/sell stop) fires on any pullback candle (bearish OR broke prior extreme). Official: enter only when pullback candle takes prior candle's low/high.
+BUG: [ProBTB] ENGINE: stop/limit fills ignore gap-through — always fill at order price±costs, never at worse open. Optimistic for ProBTB m5 stops.
+BUG: [ProBTB] FILTER not_extended: uses m15.iloc[searchsorted(arm)-1] close/EMA/ATR from FULL resample — unfinished M15 bar includes M1 AFTER arm_time (lookahead).
+BUG: [MicroMAP] H2 variant: Order.price=close[end+2] (market) but TP computed from high[end+1] stop level (entry var) — TP/risk inconsistent with fill price.
+BUG: [ENGINE] Stop gap-through: if open gaps past stop, fill should be at open±costs (worse), code uses stop±costs (better). Inflates stop-entry strategies.
+fib_unit_pass=True
+sp2l_waiver={'real_fvg': 1291, 'waived_no_gap': 1437, 'rejected_no_gap': 2355, 'waiver_pct_of_accepted': 52.68}
+gap_through={'m5_orders_checked': 4812, 'fills_found': 4043, 'gap_through_fills': 1647, 'gap_pct': 40.74, 'mean_optimistic_price_adv_usd': 2.9393296903460895, 'median_optimistic_price_adv_usd': 1.830000000000382}
+not_ext_lookahead={'checked': 3000, 'unfinished_m15_at_arm': 2984, 'close_differs_from_last_closed': 2984, 'leak_pct': 99.47}
+shift_ProBTB={"label": "ProBTB_m5_htf_notext", "baseline_oos": {"n_trades": 144, "win_rate": 0.4652777777777778, "profit_factor": 1.3157853488352016, "expectancy_r": 0.21619373235105668, "net_pnl": 94.76066785703516}, "shifts": [{"shift_min": 5, "n": 139, "pf": 1.4713253608330852, "r": 0.3099812641754644, "wr": 0.49640287769784175}, {"shift_min": 15, "n": 138, "pf": 1.9610321458377473, "r": 0.5148090111651001, "wr": 0.5652173913043478}, {"shift_min": 60, "n": 125, "pf": 2.4318471533651325, "r": 0.64702548370
+shift_AMD={"label": "AMD_asian_m5_mkt_range", "baseline_oos": {"n_trades": 22, "win_rate": 0.22727272727272727, "profit_factor": 1.5387128687717953, "expectancy_r": 0.26131914439825465, "net_pnl": 32.65810357137003}, "shifts": [{"shift_min": 5, "n": 16, "pf": 3.5925584719712234, "r": 0.7083385223704729, "wr": 0.375}, {"shift_min": 15, "n": 10, "pf": 0.6853761096398239, "r": -0.0020408784219782873, "wr": 0.4}, {"shift_min": 60, "n": 6, "pf": 0.0, "r": -2.469005169591894, "wr": 0.0}], "random": [{"k": 0, "n
+same_bar_ProBTB={'n': 144, 'same_m1_pct': 0.05555555555555555, 'same_m1_sl_n': 3, 'same_m1_sl_pct_of_trades': 2.08, 'pf': 1.3157853488352016, 'wr': 0.4652777777777778}

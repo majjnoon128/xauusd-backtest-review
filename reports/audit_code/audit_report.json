@@ -1,0 +1,1115 @@
+{
+  "mismatches": {
+    "NDS_Fib": [
+      {
+        "sev": "note",
+        "issue": "Impulse = 60% same-color M15 bars over 3-6 bars, not a clean swing structure. Mechanical approximation of 'M15 impulse'."
+      },
+      {
+        "sev": "ok",
+        "issue": "Fib zone math 0.62-0.78: long z_hi=high-0.62*move, z_lo=high-0.78*move \u2014 CORRECT retracement from impulse end."
+      },
+      {
+        "sev": "note",
+        "issue": "Entry allows low/high wick in zone OR close in zone; brief says 'retracement zone' \u2014 acceptable."
+      },
+      {
+        "sev": "note",
+        "issue": "SL buffer uses M15 ATR on M1 entry \u2014 slightly inconsistent TF but not a logic bug."
+      }
+    ],
+    "SP2L": [
+      {
+        "sev": "BUG",
+        "issue": "P-Gap/FVG is WAIVED when body move > 1.5*ATR (has_fvg=True without gap). Official: 'No gap means invalid'."
+      },
+      {
+        "sev": "BUG",
+        "issue": "Variant B (buy/sell stop) fires on any pullback candle (bearish OR broke prior extreme). Official: enter only when pullback candle takes prior candle's low/high."
+      },
+      {
+        "sev": "note",
+        "issue": "Spike candle-size gate is OR (all large OR total range) \u2014 looser than 'several large candles'."
+      },
+      {
+        "sev": "ok",
+        "issue": "SL behind spike origin extreme \u2014 matches official."
+      }
+    ],
+    "Idris": [
+      {
+        "sev": "ok",
+        "issue": "Pivot confirmation uses pivot_bar+3<=i \u2014 no lookahead on pivots."
+      },
+      {
+        "sev": "ok",
+        "issue": "Hidden bullish: HH-low + lower RSI; hidden bearish: LL-high + higher RSI \u2014 correct."
+      },
+      {
+        "sev": "note",
+        "issue": "Entry is market at IB close, not stop at IB high/low. Brief says 'Inside Bar trigger' \u2014 conservative interpretation."
+      },
+      {
+        "sev": "note",
+        "issue": "Zone = last closed H4 high/low; 'reaches zone' within 5 M1 bars + 0.15*ATR tol \u2014 approximation."
+      }
+    ],
+    "ProBTB": [
+      {
+        "sev": "ok",
+        "issue": "Mode5 = stop at breakout candle extreme after return touch \u2014 matches Amir mode list."
+      },
+      {
+        "sev": "BUG",
+        "issue": "ENGINE: stop/limit fills ignore gap-through \u2014 always fill at order price\u00b1costs, never at worse open. Optimistic for ProBTB m5 stops."
+      },
+      {
+        "sev": "BUG",
+        "issue": "FILTER not_extended: uses m15.iloc[searchsorted(arm)-1] close/EMA/ATR from FULL resample \u2014 unfinished M15 bar includes M1 AFTER arm_time (lookahead)."
+      },
+      {
+        "sev": "note",
+        "issue": "Breakout requires open near level + body>=0.3*ATR \u2014 extra constraints not in brief text."
+      },
+      {
+        "sev": "ok",
+        "issue": "Orders armed after return bar close; pending BO consumed \u2014 closed-bar OK."
+      }
+    ],
+    "MicroMAP": [
+      {
+        "sev": "note",
+        "issue": "Microchannel = monotonically non-rising highs (bull) \u2014 approximates 'lower highs' loosely (+0.05ATR slack)."
+      },
+      {
+        "sev": "BUG",
+        "issue": "H2 variant: Order.price=close[end+2] (market) but TP computed from high[end+1] stop level (entry var) \u2014 TP/risk inconsistent with fill price."
+      },
+      {
+        "sev": "ok",
+        "issue": "Single entry only (H1/IB/H2) \u2014 respects prop no-reentry."
+      }
+    ],
+    "AMD_PO3_iFVG": [
+      {
+        "sev": "note",
+        "issue": "Manipulation accepts close beyond Asian range, not only wick sweep+reject. Classic PO3 prefers liquidity grab wick."
+      },
+      {
+        "sev": "ok",
+        "issue": "Asian 00-07 UTC; London 07-10; NY 12-15 \u2014 correct for Dukascopy UTC."
+      },
+      {
+        "sev": "ok",
+        "issue": "iFVG = close through FVG opposite to manip; SL beyond manip extreme; TP opposite range \u2014 matches stated mechanical rules."
+      },
+      {
+        "sev": "note",
+        "issue": "FVG may form up to 12 bars after first sweep bar; first successful day/side wins."
+      }
+    ],
+    "ENGINE": [
+      {
+        "sev": "BUG",
+        "issue": "Stop gap-through: if open gaps past stop, fill should be at open\u00b1costs (worse), code uses stop\u00b1costs (better). Inflates stop-entry strategies."
+      },
+      {
+        "sev": "ok",
+        "issue": "Worst-case same-bar SL before TP \u2014 correct/conservative."
+      },
+      {
+        "sev": "ok",
+        "issue": "Market delay 1 M1 bar; no fill on signal bar \u2014 OK."
+      },
+      {
+        "sev": "ok",
+        "issue": "SL hard cap |entry-SL|+spread \u2014 matches $5/$7.5 rule."
+      }
+    ]
+  },
+  "fib_unit": {
+    "long_zone": [
+      122.0,
+      138.0
+    ],
+    "short_zone": [
+      162.0,
+      178.0
+    ],
+    "pass": true
+  },
+  "sp2l_fvg_waiver": {
+    "real_fvg": 1291,
+    "waived_no_gap": 1437,
+    "rejected_no_gap": 2355,
+    "waiver_pct_of_accepted": 52.68
+  },
+  "gap_through_probtb_m5": {
+    "m5_orders_checked": 4812,
+    "fills_found": 4043,
+    "gap_through_fills": 1647,
+    "gap_pct": 40.74,
+    "mean_optimistic_price_adv_usd": 2.9393296903460895,
+    "median_optimistic_price_adv_usd": 1.830000000000382
+  },
+  "not_ext_lookahead": {
+    "checked": 3000,
+    "unfinished_m15_at_arm": 2984,
+    "close_differs_from_last_closed": 2984,
+    "leak_pct": 99.47
+  },
+  "order_counts": {
+    "NDS": 3376,
+    "Idris": 439,
+    "SP2L": 9957,
+    "ProBTB_all": 23799,
+    "ProBTB_m5": 4812,
+    "ProBTB_keep_filt": 2112,
+    "MicroMAP": 101,
+    "AMD": 168
+  },
+  "sample_verify": {
+    "NDS": {
+      "strategy": "NDS",
+      "sim_n": 360,
+      "checks": [
+        {
+          "side": "short",
+          "kind": "market",
+          "reason": "TP",
+          "entry": 4153.804999999999,
+          "sl": 4157.954571428571,
+          "tp": 4150.3056428571435,
+          "entry_time": "2026-07-06 08:29:00+00:00",
+          "same_m1": false,
+          "sl_above_entry": true,
+          "tp_below_entry": true,
+          "exit_bar_low_le_tp": true,
+          "geom_ok": true
+        },
+        {
+          "side": "short",
+          "kind": "market",
+          "reason": "TP",
+          "entry": 4145.134999999999,
+          "sl": 4149.342500000001,
+          "tp": 4140.17375,
+          "entry_time": "2026-07-06 12:29:00+00:00",
+          "same_m1": false,
+          "sl_above_entry": true,
+          "tp_below_entry": true,
+          "exit_bar_low_le_tp": true,
+          "geom_ok": true
+        },
+        {
+          "side": "short",
+          "kind": "market",
+          "reason": "TP",
+          "entry": 4143.4349999999995,
+          "sl": 4146.482685714285,
+          "tp": 4140.563471428572,
+          "entry_time": "2026-07-06 15:11:00+00:00",
+          "same_m1": false,
+          "sl_above_entry": true,
+          "tp_below_entry": true,
+          "exit_bar_low_le_tp": true,
+          "geom_ok": true
+        },
+        {
+          "side": "long",
+          "kind": "market",
+          "reason": "TP",
+          "entry": 4160.5650000000005,
+          "sl": 4157.142785714286,
+          "tp": 4165.59832142857,
+          "entry_time": "2026-07-06 19:11:00+00:00",
+          "same_m1": false,
+          "sl_below_entry": true,
+          "tp_above_entry": true,
+          "exit_bar_high_ge_tp": true,
+          "geom_ok": true
+        },
+        {
+          "side": "long",
+          "kind": "market",
+          "reason": "TP",
+          "entry": 3998.415,
+          "sl": 3995.1962857142858,
+          "tp": 4003.5430714285712,
+          "entry_time": "2026-07-13 20:18:00+00:00",
+          "same_m1": false,
+          "sl_below_entry": true,
+          "tp_above_entry": true,
+          "exit_bar_high_ge_tp": true,
+          "geom_ok": true
+        },
+        {
+          "side": "short",
+          "kind": "market",
+          "reason": "SL",
+          "entry": 4176.874999999999,
+          "sl": 4181.4448571428575,
+          "tp": 4173.795214285714,
+          "entry_time": "2026-07-03 07:53:00+00:00",
+          "same_m1": false,
+          "sl_above_entry": true,
+          "tp_below_entry": true,
+          "exit_bar_high_ge_sl": true,
+          "geom_ok": true
+        },
+        {
+          "side": "short",
+          "kind": "market",
+          "reason": "SL",
+          "entry": 4177.294999999999,
+          "sl": 4180.960971428571,
+          "tp": 4171.346042857143,
+          "entry_time": "2026-07-03 08:51:00+00:00",
+          "same_m1": false,
+          "sl_above_entry": true,
+          "tp_below_entry": true,
+          "exit_bar_high_ge_sl": true,
+          "geom_ok": true
+        },
+        {
+          "side": "long",
+          "kind": "market",
+          "reason": "SL",
+          "entry": 4179.475,
+          "sl": 4175.513471428571,
+          "tp": 4181.567292857144,
+          "entry_time": "2026-07-03 09:13:00+00:00",
+          "same_m1": false,
+          "sl_below_entry": true,
+          "tp_above_entry": true,
+          "bar_or_path_hits_sl": true,
+          "exit_bar_low_le_sl": true,
+          "geom_ok": true
+        },
+        {
+          "side": "short",
+          "kind": "market",
+          "reason": "SL",
+          "entry": 4169.445,
+          "sl": 4173.424800000001,
+          "tp": 4162.975299999998,
+          "entry_time": "2026-07-03 09:35:00+00:00",
+          "same_m1": false,
+          "sl_above_entry": true,
+          "tp_below_entry": true,
+          "exit_bar_high_ge_sl": true,
+          "geom_ok": true
+        },
+        {
+          "side": "short",
+          "kind": "market",
+          "reason": "SL",
+          "entry": 4178.454999999999,
+          "sl": 4182.9511142857145,
+          "tp": 4173.885828571428,
+          "entry_time": "2026-07-03 10:18:00+00:00",
+          "same_m1": false,
+          "sl_above_entry": true,
+          "tp_below_entry": true,
+          "exit_bar_high_ge_sl": true,
+          "geom_ok": true
+        }
+      ],
+      "geom_fail": 0
+    },
+    "Idris": {
+      "strategy": "Idris",
+      "sim_n": 131,
+      "checks": [
+        {
+          "side": "short",
+          "kind": "market",
+          "reason": "SL",
+          "entry": 4124.674999999999,
+          "sl": 4123.595642857143,
+          "tp": 4116.993071428571,
+          "entry_time": "2026-07-09 13:43:00+00:00",
+          "same_m1": true,
+          "sl_above_entry": false,
+          "tp_below_entry": true,
+          "exit_bar_high_ge_sl": true,
+          "geom_ok": false
+        },
+        {
+          "side": "long",
+          "kind": "market",
+          "reason": "TP",
+          "entry": 3999.895,
+          "sl": 3998.42925,
+          "tp": 4003.81225,
+          "entry_time": "2026-07-13 18:48:00+00:00",
+          "same_m1": false,
+          "sl_below_entry": true,
+          "tp_above_entry": true,
+          "exit_bar_high_ge_tp": true,
+          "geom_ok": true
+        },
+        {
+          "side": "long",
+          "kind": "market",
+          "reason": "SL",
+          "entry": 3999.2749999999996,
+          "sl": 3999.5158928571427,
+          "tp": 4001.912321428571,
+          "entry_time": "2026-07-13 19:34:00+00:00",
+          "same_m1": true,
+          "sl_below_entry": false,
+          "tp_above_entry": true,
+          "bar_or_path_hits_sl": true,
+          "exit_bar_low_le_sl": true,
+          "geom_ok": false
+        },
+        {
+          "side": "long",
+          "kind": "market",
+          "reason": "SL",
+          "entry": 4013.725,
+          "sl": 4014.8758214285713,
+          "tp": 4015.8325357142853,
+          "entry_time": "2026-07-20 15:12:00+00:00",
+          "same_m1": true,
+          "sl_below_entry": false,
+          "tp_above_entry": true,
+          "bar_or_path_hits_sl": true,
+          "exit_bar_low_le_sl": true,
+          "geom_ok": false
+        },
+        {
+          "side": "long",
+          "kind": "market",
+          "reason": "TP",
+          "entry": 4010.865,
+          "sl": 4009.6450714285716,
+          "tp": 4012.1647857142857,
+          "entry_time": "2026-07-29 15:31:00+00:00",
+          "same_m1": false,
+          "sl_below_entry": true,
+          "tp_above_entry": true,
+          "exit_bar_high_ge_tp": true,
+          "geom_ok": true
+        },
+        {
+          "side": "long",
+          "kind": "market",
+          "reason": "TP",
+          "entry": 4165.765,
+          "sl": 4164.726785714286,
+          "tp": 4165.119642857141,
+          "entry_time": "2026-07-03 14:41:00+00:00",
+          "same_m1": true,
+          "sl_below_entry": true,
+          "tp_above_entry": false,
+          "exit_bar_high_ge_tp": true,
+          "geom_ok": false
+        },
+        {
+          "side": "short",
+          "kind": "market",
+          "reason": "TP",
+          "entry": 4087.4750000000004,
+          "sl": 4091.3761785714287,
+          "tp": 4089.7314642857145,
+          "entry_time": "2026-07-08 18:52:00+00:00",
+          "same_m1": true,
+          "sl_above_entry": true,
+          "tp_below_entry": false,
+          "exit_bar_low_le_tp": true,
+          "geom_ok": false
+        },
+        {
+          "side": "short",
+          "kind": "market",
+          "reason": "TP",
+          "entry": 4110.414999999999,
+          "sl": 4113.823142857143,
+          "tp": 4111.310571428571,
+          "entry_time": "2026-07-09 08:46:00+00:00",
+          "same_m1": true,
+          "sl_above_entry": true,
+          "tp_below_entry": false,
+          "exit_bar_low_le_tp": true,
+          "geom_ok": false
+        },
+        {
+          "side": "short",
+          "kind": "market",
+          "reason": "SL",
+          "entry": 4110.904999999999,
+          "sl": 4111.551642857144,
+          "tp": 4105.6050714285675,
+          "entry_time": "2026-07-09 09:21:00+00:00",
+          "same_m1": true,
+          "sl_above_entry": true,
+          "tp_below_entry": true,
+          "exit_bar_high_ge_sl": true,
+          "geom_ok": true
+        },
+        {
+          "side": "long",
+          "kind": "market",
+          "reason": "SL",
+          "entry": 3999.995,
+          "sl": 3997.599357142857,
+          "tp": 4004.0619285714292,
+          "entry_time": "2026-07-13 17:34:00+00:00",
+          "same_m1": false,
+          "sl_below_entry": true,
+          "tp_above_entry": true,
+          "bar_or_path_hits_sl": true,
+          "exit_bar_low_le_sl": true,
+          "geom_ok": true
+        }
+      ],
+      "geom_fail": 6
+    },
+    "SP2L": {
+      "strategy": "SP2L",
+      "sim_n": 12,
+      "checks": [
+        {
+          "side": "long",
+          "kind": "market",
+          "reason": "TP",
+          "entry": 4163.585000000001,
+          "sl": 4160.584464285715,
+          "tp": 4165.065535714285,
+          "entry_time": "2026-07-06 20:46:00+00:00",
+          "same_m1": false,
+          "sl_below_entry": true,
+          "tp_above_entry": true,
+          "exit_bar_high_ge_tp": true,
+          "geom_ok": true
+        },
+        {
+          "side": "short",
+          "kind": "market",
+          "reason": "TP",
+          "entry": 4039.875,
+          "sl": 4043.257607142857,
+          "tp": 4036.072392857143,
+          "entry_time": "2026-07-28 17:06:00+00:00",
+          "same_m1": false,
+          "sl_above_entry": true,
+          "tp_below_entry": true,
+          "exit_bar_low_le_tp": true,
+          "geom_ok": true
+        },
+        {
+          "side": "short",
+          "kind": "market",
+          "reason": "TP",
+          "entry": 4407.044999999999,
+          "sl": 4410.670071428572,
+          "tp": 4404.779928571429,
+          "entry_time": "2026-09-07 18:11:00+00:00",
+          "same_m1": false,
+          "sl_above_entry": true,
+          "tp_below_entry": true,
+          "exit_bar_low_le_tp": true,
+          "geom_ok": true
+        },
+        {
+          "side": "long",
+          "kind": "stop",
+          "reason": "SL",
+          "entry": 4124.685,
+          "sl": 4120.140857142857,
+          "tp": 4128.329142857142,
+          "entry_time": "2026-07-09 20:55:00+00:00",
+          "same_m1": false,
+          "sl_below_entry": true,
+          "tp_above_entry": true,
+          "bar_touches_stop": true,
+          "bar_or_path_hits_sl": true,
+          "exit_bar_low_le_sl": true,
+          "geom_ok": true
+        },
+        {
+          "side": "long",
+          "kind": "market",
+          "reason": "SL",
+          "entry": 4061.7549999999997,
+          "sl": 4057.1530357142856,
+          "tp": 4065.036964285714,
+          "entry_time": "2026-07-24 11:16:00+00:00",
+          "same_m1": false,
+          "sl_below_entry": true,
+          "tp_above_entry": true,
+          "bar_or_path_hits_sl": true,
+          "exit_bar_low_le_sl": true,
+          "geom_ok": true
+        },
+        {
+          "side": "short",
+          "kind": "market",
+          "reason": "SL",
+          "entry": 4080.7450000000003,
+          "sl": 4081.189107142857,
+          "tp": 4071.940892857143,
+          "entry_time": "2026-07-27 22:01:00+00:00",
+          "same_m1": true,
+          "sl_above_entry": true,
+          "tp_below_entry": true,
+          "exit_bar_high_ge_sl": true,
+          "geom_ok": true
+        },
+        {
+          "side": "short",
+          "kind": "market",
+          "reason": "SL",
+          "entry": 4023.895,
+          "sl": 4028.0143214285717,
+          "tp": 4019.2956785714287,
+          "entry_time": "2026-07-28 20:16:00+00:00",
+          "same_m1": false,
+          "sl_above_entry": true,
+          "tp_below_entry": true,
+          "exit_bar_high_ge_sl": true,
+          "geom_ok": true
+        },
+        {
+          "side": "short",
+          "kind": "market",
+          "reason": "SL",
+          "entry": 4047.4750000000004,
+          "sl": 4051.828107142857,
+          "tp": 4043.541892857143,
+          "entry_time": "2026-07-31 20:21:00+00:00",
+          "same_m1": false,
+          "sl_above_entry": true,
+          "tp_below_entry": true,
+          "exit_bar_high_ge_sl": true,
+          "geom_ok": true
+        }
+      ],
+      "geom_fail": 0
+    },
+    "ProBTB_m5_keepfilt": {
+      "strategy": "ProBTB",
+      "sim_n": 144,
+      "checks": [
+        {
+          "side": "short",
+          "kind": "stop",
+          "reason": "TP",
+          "entry": 4140.634999999999,
+          "sl": 4145.159142857143,
+          "tp": 4132.9367142857145,
+          "entry_time": "2026-07-07 18:10:00+00:00",
+          "same_m1": false,
+          "sl_above_entry": true,
+          "tp_below_entry": true,
+          "bar_touches_stop": true,
+          "exit_bar_low_le_tp": true,
+          "geom_ok": true
+        },
+        {
+          "side": "short",
+          "kind": "stop",
+          "reason": "TP",
+          "entry": 4109.784999999999,
+          "sl": 4113.914142857143,
+          "tp": 4102.876714285713,
+          "entry_time": "2026-07-10 07:45:00+00:00",
+          "same_m1": false,
+          "sl_above_entry": true,
+          "tp_below_entry": true,
+          "bar_touches_stop": true,
+          "exit_bar_low_le_tp": true,
+          "geom_ok": true
+        },
+        {
+          "side": "short",
+          "kind": "stop",
+          "reason": "TP",
+          "entry": 4104.994999999999,
+          "sl": 4108.525214285714,
+          "tp": 4099.28457142857,
+          "entry_time": "2026-07-10 10:59:00+00:00",
+          "same_m1": false,
+          "sl_above_entry": true,
+          "tp_below_entry": true,
+          "bar_touches_stop": true,
+          "exit_bar_low_le_tp": true,
+          "geom_ok": true
+        },
+        {
+          "side": "short",
+          "kind": "stop",
+          "reason": "TP",
+          "entry": 4105.134999999999,
+          "sl": 4108.986892857143,
+          "tp": 4098.781214285714,
+          "entry_time": "2026-07-10 17:00:00+00:00",
+          "same_m1": false,
+          "sl_above_entry": true,
+          "tp_below_entry": true,
+          "bar_touches_stop": true,
+          "exit_bar_low_le_tp": true,
+          "geom_ok": true
+        },
+        {
+          "side": "long",
+          "kind": "stop",
+          "reason": "TP",
+          "entry": 4109.305,
+          "sl": 4105.270392857143,
+          "tp": 4116.024214285713,
+          "entry_time": "2026-07-10 20:05:00+00:00",
+          "same_m1": false,
+          "sl_below_entry": true,
+          "tp_above_entry": true,
+          "bar_touches_stop": true,
+          "exit_bar_high_ge_tp": true,
+          "geom_ok": true
+        },
+        {
+          "side": "short",
+          "kind": "stop",
+          "reason": "SL",
+          "entry": 4166.214999999999,
+          "sl": 4169.752821428571,
+          "tp": 4160.489357142857,
+          "entry_time": "2026-07-03 15:35:00+00:00",
+          "same_m1": false,
+          "sl_above_entry": true,
+          "tp_below_entry": true,
+          "bar_touches_stop": true,
+          "exit_bar_high_ge_sl": true,
+          "geom_ok": true
+        },
+        {
+          "side": "long",
+          "kind": "stop",
+          "reason": "SL",
+          "entry": 4160.235000000001,
+          "sl": 4155.811571428571,
+          "tp": 4167.731857142857,
+          "entry_time": "2026-07-06 17:56:00+00:00",
+          "same_m1": false,
+          "sl_below_entry": true,
+          "tp_above_entry": true,
+          "bar_touches_stop": true,
+          "bar_or_path_hits_sl": true,
+          "exit_bar_low_le_sl": true,
+          "geom_ok": true
+        },
+        {
+          "side": "long",
+          "kind": "stop",
+          "reason": "SL",
+          "entry": 4161.825000000001,
+          "sl": 4157.830821428572,
+          "tp": 4168.463357142857,
+          "entry_time": "2026-07-06 18:25:00+00:00",
+          "same_m1": false,
+          "sl_below_entry": true,
+          "tp_above_entry": true,
+          "bar_touches_stop": true,
+          "bar_or_path_hits_sl": true,
+          "exit_bar_low_le_sl": true,
+          "geom_ok": true
+        },
+        {
+          "side": "short",
+          "kind": "stop",
+          "reason": "SL",
+          "entry": 4123.704999999999,
+          "sl": 4126.833250000001,
+          "tp": 4118.798499999998,
+          "entry_time": "2026-07-07 08:53:00+00:00",
+          "same_m1": false,
+          "sl_above_entry": true,
+          "tp_below_entry": true,
+          "bar_touches_stop": true,
+          "exit_bar_high_ge_sl": true,
+          "geom_ok": true
+        },
+        {
+          "side": "short",
+          "kind": "stop",
+          "reason": "SL",
+          "entry": 4142.315,
+          "sl": 4146.528464285714,
+          "tp": 4135.238071428573,
+          "entry_time": "2026-07-07 16:41:00+00:00",
+          "same_m1": false,
+          "sl_above_entry": true,
+          "tp_below_entry": true,
+          "bar_touches_stop": true,
+          "exit_bar_high_ge_sl": true,
+          "geom_ok": true
+        }
+      ],
+      "geom_fail": 0
+    },
+    "MicroMAP": {
+      "strategy": "MicroMAP",
+      "sim_n": 7,
+      "checks": [
+        {
+          "side": "short",
+          "kind": "stop",
+          "reason": "SL",
+          "entry": 4138.544999999999,
+          "sl": 4142.753000000001,
+          "tp": 4133.357999999998,
+          "entry_time": "2026-07-06 13:00:00+00:00",
+          "same_m1": true,
+          "sl_above_entry": true,
+          "tp_below_entry": true,
+          "bar_touches_stop": true,
+          "exit_bar_high_ge_sl": true,
+          "geom_ok": true
+        },
+        {
+          "side": "long",
+          "kind": "stop",
+          "reason": "SL",
+          "entry": 4112.805,
+          "sl": 4110.26525,
+          "tp": 4115.489624999998,
+          "entry_time": "2026-07-10 20:21:00+00:00",
+          "same_m1": false,
+          "sl_below_entry": true,
+          "tp_above_entry": true,
+          "bar_touches_stop": true,
+          "bar_or_path_hits_sl": true,
+          "exit_bar_low_le_sl": true,
+          "geom_ok": true
+        },
+        {
+          "side": "short",
+          "kind": "stop",
+          "reason": "SL",
+          "entry": 4347.554999999999,
+          "sl": 4351.456392857142,
+          "tp": 4342.827910714286,
+          "entry_time": "2026-08-13 19:46:00+00:00",
+          "same_m1": false,
+          "sl_above_entry": true,
+          "tp_below_entry": true,
+          "bar_touches_stop": true,
+          "exit_bar_high_ge_sl": true,
+          "geom_ok": true
+        },
+        {
+          "side": "long",
+          "kind": "stop",
+          "reason": "SL",
+          "entry": 4394.1050000000005,
+          "sl": 4391.0744642857135,
+          "tp": 4397.525803571429,
+          "entry_time": "2026-08-18 08:55:00+00:00",
+          "same_m1": false,
+          "sl_below_entry": true,
+          "tp_above_entry": true,
+          "bar_touches_stop": true,
+          "bar_or_path_hits_sl": true,
+          "exit_bar_low_le_sl": true,
+          "geom_ok": true
+        },
+        {
+          "side": "short",
+          "kind": "market",
+          "reason": "SL",
+          "entry": 4329.804999999999,
+          "sl": 4330.433642857143,
+          "tp": 4311.8377142857125,
+          "entry_time": "2026-09-01 20:06:00+00:00",
+          "same_m1": false,
+          "sl_above_entry": true,
+          "tp_below_entry": true,
+          "exit_bar_high_ge_sl": true,
+          "geom_ok": true
+        }
+      ],
+      "geom_fail": 0
+    },
+    "AMD": {
+      "strategy": "AMD",
+      "sim_n": 22,
+      "checks": [
+        {
+          "side": "long",
+          "kind": "market",
+          "reason": "SL",
+          "entry": 4074.745,
+          "sl": 4075.5052499999997,
+          "tp": 4116.145,
+          "entry_time": "2026-07-27 15:01:00+00:00",
+          "same_m1": true,
+          "sl_below_entry": false,
+          "tp_above_entry": true,
+          "bar_or_path_hits_sl": true,
+          "exit_bar_low_le_sl": true,
+          "geom_ok": false
+        },
+        {
+          "side": "long",
+          "kind": "market",
+          "reason": "TP",
+          "entry": 4004.535,
+          "sl": 4001.9627142857144,
+          "tp": 4044.605,
+          "entry_time": "2026-07-29 14:56:00+00:00",
+          "same_m1": false,
+          "sl_below_entry": true,
+          "tp_above_entry": true,
+          "exit_bar_high_ge_tp": true,
+          "geom_ok": true
+        },
+        {
+          "side": "long",
+          "kind": "market",
+          "reason": "SL",
+          "entry": 4360.287000000001,
+          "sl": 4361.175607142857,
+          "tp": 4435.108,
+          "entry_time": "2026-09-10 13:36:00+00:00",
+          "same_m1": true,
+          "sl_below_entry": false,
+          "tp_above_entry": true,
+          "bar_or_path_hits_sl": true,
+          "exit_bar_low_le_sl": true,
+          "geom_ok": false
+        },
+        {
+          "side": "long",
+          "kind": "market",
+          "reason": "TP",
+          "entry": 4270.828,
+          "sl": 4266.240985714286,
+          "tp": 4317.245,
+          "entry_time": "2026-09-15 09:51:00+00:00",
+          "same_m1": false,
+          "sl_below_entry": true,
+          "tp_above_entry": true,
+          "exit_bar_high_ge_tp": true,
+          "geom_ok": true
+        },
+        {
+          "side": "long",
+          "kind": "market",
+          "reason": "SL",
+          "entry": 4266.755000000001,
+          "sl": 4267.241357142857,
+          "tp": 4302.865,
+          "entry_time": "2026-09-24 08:41:00+00:00",
+          "same_m1": true,
+          "sl_below_entry": false,
+          "tp_above_entry": true,
+          "bar_or_path_hits_sl": true,
+          "exit_bar_low_le_sl": true,
+          "geom_ok": false
+        },
+        {
+          "side": "long",
+          "kind": "market",
+          "reason": "SL",
+          "entry": 4138.275000000001,
+          "sl": 4135.431071428572,
+          "tp": 4202.905,
+          "entry_time": "2026-07-06 15:01:00+00:00",
+          "same_m1": false,
+          "sl_below_entry": true,
+          "tp_above_entry": true,
+          "bar_or_path_hits_sl": true,
+          "exit_bar_low_le_sl": true,
+          "geom_ok": true
+        },
+        {
+          "side": "long",
+          "kind": "market",
+          "reason": "SL",
+          "entry": 4044.605,
+          "sl": 4041.251285714286,
+          "tp": 4133.685,
+          "entry_time": "2026-07-08 14:56:00+00:00",
+          "same_m1": false,
+          "sl_below_entry": true,
+          "tp_above_entry": true,
+          "bar_or_path_hits_sl": true,
+          "exit_bar_low_le_sl": true,
+          "geom_ok": true
+        },
+        {
+          "side": "long",
+          "kind": "market",
+          "reason": "SL",
+          "entry": 4103.005000000001,
+          "sl": 4102.933714285714,
+          "tp": 4134.555,
+          "entry_time": "2026-07-10 09:51:00+00:00",
+          "same_m1": true,
+          "sl_below_entry": true,
+          "tp_above_entry": true,
+          "bar_or_path_hits_sl": true,
+          "exit_bar_low_le_sl": true,
+          "geom_ok": true
+        },
+        {
+          "side": "long",
+          "kind": "market",
+          "reason": "SL",
+          "entry": 4092.845,
+          "sl": 4089.5561785714285,
+          "tp": 4140.895,
+          "entry_time": "2026-07-23 09:51:00+00:00",
+          "same_m1": false,
+          "sl_below_entry": true,
+          "tp_above_entry": true,
+          "bar_or_path_hits_sl": true,
+          "exit_bar_low_le_sl": true,
+          "geom_ok": true
+        },
+        {
+          "side": "short",
+          "kind": "market",
+          "reason": "SL",
+          "entry": 4058.1150000000002,
+          "sl": 4061.1355,
+          "tp": 4021.665,
+          "entry_time": "2026-07-24 14:16:00+00:00",
+          "same_m1": false,
+          "sl_above_entry": true,
+          "tp_below_entry": true,
+          "exit_bar_high_ge_sl": true,
+          "geom_ok": true
+        }
+      ],
+      "geom_fail": 3
+    }
+  },
+  "shift_random_ProBTB": {
+    "label": "ProBTB_m5_htf_notext",
+    "baseline_oos": {
+      "n_trades": 144,
+      "win_rate": 0.4652777777777778,
+      "profit_factor": 1.3157853488352016,
+      "expectancy_r": 0.21619373235105668,
+      "net_pnl": 94.76066785703516
+    },
+    "shifts": [
+      {
+        "shift_min": 5,
+        "n": 139,
+        "pf": 1.4713253608330852,
+        "r": 0.3099812641754644,
+        "wr": 0.49640287769784175
+      },
+      {
+        "shift_min": 15,
+        "n": 138,
+        "pf": 1.9610321458377473,
+        "r": 0.5148090111651001,
+        "wr": 0.5652173913043478
+      },
+      {
+        "shift_min": 60,
+        "n": 125,
+        "pf": 2.4318471533651325,
+        "r": 0.6470254837060557,
+        "wr": 0.608
+      }
+    ],
+    "random": [
+      {
+        "k": 0,
+        "n": 141,
+        "pf": 0.7505215628442364,
+        "r": -0.18413190182838604
+      },
+      {
+        "k": 1,
+        "n": 164,
+        "pf": 1.0136283254568554,
+        "r": 0.009686543545183385
+      },
+      {
+        "k": 2,
+        "n": 137,
+        "pf": 0.713759577621839,
+        "r": -0.20242160181579713
+      }
+    ],
+    "edge_survives_shift": true,
+    "random_mean_pf": 0.8259698219743102
+  },
+  "shift_random_AMD": {
+    "label": "AMD_asian_m5_mkt_range",
+    "baseline_oos": {
+      "n_trades": 22,
+      "win_rate": 0.22727272727272727,
+      "profit_factor": 1.5387128687717953,
+      "expectancy_r": 0.26131914439825465,
+      "net_pnl": 32.65810357137003
+    },
+    "shifts": [
+      {
+        "shift_min": 5,
+        "n": 16,
+        "pf": 3.5925584719712234,
+        "r": 0.7083385223704729,
+        "wr": 0.375
+      },
+      {
+        "shift_min": 15,
+        "n": 10,
+        "pf": 0.6853761096398239,
+        "r": -0.0020408784219782873,
+        "wr": 0.4
+      },
+      {
+        "shift_min": 60,
+        "n": 6,
+        "pf": 0.0,
+        "r": -2.469005169591894,
+        "wr": 0.0
+      }
+    ],
+    "random": [
+      {
+        "k": 0,
+        "n": 17,
+        "pf": 0.02895090269409088,
+        "r": -1.5579012229467766
+      },
+      {
+        "k": 1,
+        "n": 20,
+        "pf": 1.6586792534672585,
+        "r": 0.19555667306619812
+      },
+      {
+        "k": 2,
+        "n": 15,
+        "pf": 0.29027363711283,
+        "r": -0.7611748983484522
+      }
+    ],
+    "edge_survives_shift": true,
+    "random_mean_pf": 0.6593012644247265
+  },
+  "same_bar_ProBTB": {
+    "n": 144,
+    "same_m1_pct": 0.05555555555555555,
+    "same_m1_sl_n": 3,
+    "same_m1_sl_pct_of_trades": 2.08,
+    "pf": 1.3157853488352016,
+    "wr": 0.4652777777777778
+  },
+  "same_bar_AMD": {
+    "n": 22,
+    "same_m1_pct": 0.45454545454545453,
+    "same_m1_sl_n": 10,
+    "same_m1_sl_pct_of_trades": 45.45,
+    "pf": 1.5387128687717953,
+    "wr": 0.22727272727272727
+  }
+}

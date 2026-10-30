@@ -1,0 +1,2595 @@
+
+
+##### FILE: src/strategies/ema_arsalan.py #####
+"""Arsalan EMA setups on XAUUSD.
+
+Mode 1 — sharp trend continuation:
+  M1+EMA60 or M5+EMA20. Sharp = last N bars mostly one side of EMA, low body-overlap,
+  EMA slope/ATR high, price displaced >k*ATR from EMA before pullback.
+  Entry: limit at EMA on 1st touch (also 2nd/3rd). SL behind minor swing preceding pullback.
+  TP 1R / 1.5R / 2R.
+
+Mode 2 — weak trend reversal:
+  EMA20 on M1 or M5. Weak = high avg body-overlap while still one-sided vs EMA.
+  Entry: close of strong full-body candle (body>=body_frac*range, body>=x*ATR) that closes
+  across EMA20 against the weak trend. SL beyond that candle. TP 1R / 2R.
+  Filters: leaves FVG (3-candle gap); optional at 24h range extreme → use TP2 only variant.
+
+Prop: all orders get min_hold_minutes=2 (engine defers SL/TP until ≥2 M1 bars).
+"""
+from __future__ import annotations
+import numpy as np
+import pandas as pd
+from typing import Dict, List, Tuple
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from engine import Order
+from indicators import atr_prior, ema, resample_ohlc, bar_end
+from strategies.common import dedupe_orders
+from strategies.ict_helpers import swing_highs_lows, last_swing_before, find_fvgs
+
+
+def _body_overlap_frac(o, h, l, c, i) -> float:
+    """Fraction of current body contained in prior bar's range. 0 if no body."""
+    if i < 1:
+        return 0.0
+    body_lo, body_hi = min(float(o[i]), float(c[i])), max(float(o[i]), float(c[i]))
+    if body_hi - body_lo < 1e-9:
+        return 1.0  # doji → full overlap-ish
+    prev_lo, prev_hi = float(l[i - 1]), float(h[i - 1])
+    inter = max(0.0, min(body_hi, prev_hi) - max(body_lo, prev_lo))
+    return inter / (body_hi - body_lo)
+
+
+def _avg_overlap(o, h, l, c, i, n_bars) -> float:
+    vals = [_body_overlap_frac(o, h, l, c, j) for j in range(i - n_bars + 1, i + 1) if j >= 1]
+    return float(np.mean(vals)) if vals else 1.0
+
+
+def _side_ratio(c, ema_v, i, n_bars, side: str) -> float:
+    """Fraction of last n closes on trend side of EMA."""
+    s = 0
+    for j in range(i - n_bars + 1, i + 1):
+        if side == "long" and c[j] > ema_v[j]:
+            s += 1
+        elif side == "short" and c[j] < ema_v[j]:
+            s += 1
+    return s / n_bars
+
+
+def _ema_slope_atr(ema_v, atr_v, i, look=5) -> float:
+    if i < look or np.isnan(atr_v[i]) or atr_v[i] <= 0:
+        return 0.0
+    return abs(ema_v[i] - ema_v[i - look]) / atr_v[i]
+
+
+def _day_range(h, l, times, i, hours=24):
+    t0 = times[i] - pd.Timedelta(hours=hours)
+    j0 = times.searchsorted(t0, side="left")
+    if j0 >= i:
+        return None, None
+    return float(np.max(h[j0:i + 1])), float(np.min(l[j0:i + 1]))
+
+
+def generate_ema_arsalan_mode1(
+    m1: pd.DataFrame,
+    entry_tf: str = "M1",       # M1 | M5
+    ema_len: int | None = None, # default 60 for M1, 20 for M5
+    n_bars: int = 15,
+    max_overlap: float = 0.45,
+    min_side: float = 0.75,
+    min_slope_atr: float = 0.15,
+    min_disp_atr: float = 0.8,
+    touch_max: int = 1,         # 1 | 2 | 3
+    rr: float = 1.5,
+    atr_buf: float = 0.1,
+) -> List[Order]:
+    bar_m = 1 if entry_tf == "M1" else 5
+    ema_len = ema_len if ema_len is not None else (60 if entry_tf == "M1" else 20)
+    df = m1 if entry_tf == "M1" else resample_ohlc(m1, "5min")
+    o, h, l, c = df["open"].values, df["high"].values, df["low"].values, df["close"].values
+    times = df.index
+    n = len(df)
+    a = atr_prior(df, 14).values
+    e = ema(df["close"], ema_len).values
+    shi, sli = swing_highs_lows(h, l, 2, 2)
+
+    variant = f"arsalan_m1sharp_{entry_tf}_ema{ema_len}_n{n_bars}_ov{max_overlap}_t{touch_max}_rr{rr}"
+    orders: List[Order] = []
+    # track touches per sharp regime
+    touch_count = 0
+    regime_side = None
+    regime_start = -1
+
+    for i in range(max(ema_len + n_bars + 5, 40), n - 1):
+        if int(getattr(times[i], "day_of_week", times[i].dayofweek)) >= 5:
+            continue
+        atr_v = a[i]
+        if np.isnan(atr_v) or atr_v <= 0 or np.isnan(e[i]):
+            continue
+        # Determine trend side from EMA slope
+        slope = e[i] - e[i - 5]
+        side = "long" if slope > 0 else "short"
+        # Sharp checks on bar i-1 (closed context before pullback touch)
+        j = i  # evaluate at current closed bar
+        if _side_ratio(c, e, j, n_bars, side) < min_side:
+            touch_count = 0; regime_side = None; continue
+        if _avg_overlap(o, h, l, c, j, n_bars) > max_overlap:
+            touch_count = 0; regime_side = None; continue
+        if _ema_slope_atr(e, a, j) < min_slope_atr:
+            touch_count = 0; regime_side = None; continue
+        # Displacement: max distance from EMA in last n_bars > k*ATR
+        disp = 0.0
+        for k in range(j - n_bars + 1, j + 1):
+            disp = max(disp, abs(c[k] - e[k]) / atr_v)
+        if disp < min_disp_atr:
+            touch_count = 0; regime_side = None; continue
+
+        if regime_side != side:
+            regime_side = side
+            touch_count = 0
+            regime_start = j
+
+        # Pullback touch: price trades through EMA this bar (wick/body)
+        touched = (l[j] <= e[j] <= h[j])
+        if not touched:
+            continue
+        # First touch after displacement: require that a few bars ago price was away
+        away = False
+        for k in range(max(regime_start, j - n_bars), j):
+            if side == "long" and c[k] > e[k] + min_disp_atr * 0.5 * atr_v:
+                away = True; break
+            if side == "short" and c[k] < e[k] - min_disp_atr * 0.5 * atr_v:
+                away = True; break
+        if not away:
+            continue
+
+        touch_count += 1
+        if touch_count > touch_max:
+            continue
+
+        px = float(e[j])  # limit at EMA
+        buf = max(atr_buf * atr_v, 0.10)
+        if side == "long":
+            sw = last_swing_before(sli, j)
+            if sw is None:
+                continue
+            sl = float(l[sw]) - buf
+            if sl >= px:
+                sl = px - max(0.3 * atr_v, 0.25)
+        else:
+            sw = last_swing_before(shi, j)
+            if sw is None:
+                continue
+            sl = float(h[sw]) + buf
+            if sl <= px:
+                sl = px + max(0.3 * atr_v, 0.25)
+        risk = abs(px - sl)
+        if risk < 0.20:
+            continue
+        tp = px + rr * risk if side == "long" else px - rr * risk
+        arm = bar_end(times[j], bar_m)
+        orders.append(Order(
+            arm_time=arm, side=side, kind="limit", price=px, sl=float(sl), tp=float(tp),
+            strategy="ArsalanEMA", variant=variant,
+            meta={"mode": 1, "touch": touch_count, "ema": px},
+            expire_minutes=30, max_hold_minutes=240, min_hold_minutes=2,
+        ))
+
+    return dedupe_orders(orders, 20)
+
+
+def generate_ema_arsalan_mode2(
+    m1: pd.DataFrame,
+    entry_tf: str = "M1",       # M1 | M5
+    ema_len: int = 20,
+    n_bars: int = 15,
+    min_overlap: float = 0.55,  # weak = high overlap
+    min_side: float = 0.65,
+    body_frac: float = 0.65,
+    body_atr: float = 0.5,
+    rr: float = 2.0,
+    require_fvg: bool = True,
+    range_extreme: bool = False,  # only take if signal near 24h high/low
+    atr_buf: float = 0.05,
+) -> List[Order]:
+    bar_m = 1 if entry_tf == "M1" else 5
+    df = m1 if entry_tf == "M1" else resample_ohlc(m1, "5min")
+    o, h, l, c = df["open"].values, df["high"].values, df["low"].values, df["close"].values
+    times = df.index
+    n = len(df)
+    a = atr_prior(df, 14).values
+    e = ema(df["close"], ema_len).values
+
+    tag_fvg = "fvg" if require_fvg else "nofvg"
+    tag_rx = "rx" if range_extreme else "any"
+    variant = f"arsalan_m2rev_{entry_tf}_ema{ema_len}_ov{min_overlap}_bf{body_frac}_rr{rr}_{tag_fvg}_{tag_rx}"
+    orders: List[Order] = []
+
+    for i in range(max(ema_len + n_bars + 5, 40), n - 1):
+        if int(getattr(times[i], "day_of_week", times[i].dayofweek)) >= 5:
+            continue
+        atr_v = a[i]
+        if np.isnan(atr_v) or atr_v <= 0 or np.isnan(e[i]):
+            continue
+        # Weak trend direction (still one-sided but choppy)
+        slope = e[i] - e[i - 5]
+        weak_side = "long" if slope > 0 else "short"  # prevailing weak trend
+        if _side_ratio(c, e, i, n_bars, weak_side) < min_side:
+            continue
+        if _avg_overlap(o, h, l, c, i, n_bars) < min_overlap:
+            continue
+
+        # Strong reversal candle closing across EMA against weak trend
+        rng = h[i] - l[i]
+        if rng < 1e-9:
+            continue
+        body = abs(c[i] - o[i])
+        if body / rng < body_frac or body < body_atr * atr_v:
+            continue
+
+        if weak_side == "long":
+            # against = short: bearish close across/below EMA
+            if not (c[i] < o[i] and c[i] < e[i] and o[i] > e[i]):
+                # also allow close below EMA from above
+                if not (c[i] < o[i] and c[i] < e[i]):
+                    continue
+            side = "short"
+        else:
+            if not (c[i] > o[i] and c[i] > e[i]):
+                continue
+            side = "long"
+
+        if require_fvg:
+            # candle leaves FVG: 3-candle gap in signal direction ending at i
+            fvgs = find_fvgs(h, l, a, max(i - 3, 0), i, "bear" if side == "short" else "bull", min_atr=0.05)
+            if not fvgs or fvgs[-1][2] != i:
+                # also accept FVG formed at i-1 or i
+                if not fvgs:
+                    continue
+                if fvgs[-1][2] < i - 1:
+                    continue
+
+        if range_extreme:
+            dh, dl = _day_range(h, l, times, i, 24)
+            if dh is None:
+                continue
+            # signal near extreme of weak trend
+            if weak_side == "long" and side == "short":
+                if h[i] < dh - 0.15 * atr_v:
+                    continue
+            elif weak_side == "short" and side == "long":
+                if l[i] > dl + 0.15 * atr_v:
+                    continue
+            else:
+                continue
+
+        px = float(c[i])
+        buf = max(atr_buf * atr_v, 0.08)
+        if side == "long":
+            sl = float(l[i]) - buf
+        else:
+            sl = float(h[i]) + buf
+        risk = abs(px - sl)
+        if risk < 0.15:
+            continue
+        tp = px + rr * risk if side == "long" else px - rr * risk
+        arm = bar_end(times[i], bar_m)
+        orders.append(Order(
+            arm_time=arm, side=side, kind="market", price=px, sl=float(sl), tp=float(tp),
+            strategy="ArsalanEMA", variant=variant,
+            meta={"mode": 2, "weak_side": weak_side},
+            expire_minutes=15, max_hold_minutes=180, min_hold_minutes=2,
+        ))
+
+    return dedupe_orders(orders, 25)
+
+
+def generate_ema_arsalan_family(m1: pd.DataFrame) -> Dict[str, List[Order]]:
+    """Focused family grid for IS selection."""
+    pools: Dict[str, List[Order]] = {}
+    # Mode 1
+    for tf, ema_len in (("M1", 60), ("M5", 20)):
+        for n_bars, max_ov in ((12, 0.65), (18, 0.55)):
+            for touch in (1, 3):
+                for rr in (1.0, 1.5, 2.0):
+                    print(f" M1sharp {tf} ema{ema_len} n{n_bars} ov{max_ov} t{touch} rr{rr}", flush=True)
+                    oo = generate_ema_arsalan_mode1(
+                        m1, entry_tf=tf, ema_len=ema_len, n_bars=n_bars,
+                        max_overlap=max_ov, touch_max=touch, rr=rr,
+                    )
+                    if oo:
+                        pools[oo[0].variant] = oo
+                        print(f"  n={len(oo)}", flush=True)
+    # Mode 2 (tighter body_atr on M1 to curb spam)
+    for tf in ("M1", "M5"):
+        for ov in (0.60, 0.70):
+            for bf in (0.65, 0.75):
+                for rr in (1.0, 2.0):
+                    for fvg in (True, False):
+                        for rx in (False, True):
+                            if rx and rr != 2.0:
+                                continue
+                            bat = 0.8 if tf == "M1" else 0.5
+                            print(f" M2rev {tf} ov{ov} bf{bf} rr{rr} fvg{fvg} rx{rx}", flush=True)
+                            oo = generate_ema_arsalan_mode2(
+                                m1, entry_tf=tf, min_overlap=ov, body_frac=bf,
+                                body_atr=bat, rr=rr, require_fvg=fvg, range_extreme=rx,
+                            )
+                            if oo:
+                                pools[oo[0].variant] = oo
+                                print(f"  n={len(oo)}", flush=True)
+    return pools
+
+
+##### FILE: src/strategies/ema_pullback.py #####
+"""EMA trend pullback — H1 and M15."""
+from __future__ import annotations
+import numpy as np
+import pandas as pd
+from typing import List
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from engine import Order
+from indicators import ema, atr_prior, resample_ohlc, bar_end, is_bull, is_bear
+from strategies.common import apply_dxy_gate, dedupe_orders
+
+
+def generate_ema_pullback(
+    m1: pd.DataFrame,
+    dxy=None,
+    use_dxy: bool = False,
+    rule: str = "1h",           # 1h | 15min
+    trend: str = "ema50_200",   # ema50_200 | slope50
+    pullback_ema: int = 20,     # 20 | 50
+    rr: float = 2.0,
+    sl_mode: str = "swing",     # swing | atr
+    trail: bool = False,
+) -> List[Order]:
+    df = resample_ohlc(m1, rule)
+    bar_min = {"15min": 15, "1h": 60, "5min": 5}.get(rule, 60)
+    c = df["close"]
+    e20 = ema(c, 20)
+    e50 = ema(c, 50)
+    e200 = ema(c, 200)
+    a = atr_prior(df, 14)
+    bull, bear = is_bull(df).values, is_bear(df).values
+    high, low, close, open_ = df["high"].values, df["low"].values, df["close"].values, df["open"].values
+    times = df.index
+    n = len(df)
+    pb = e20 if pullback_ema == 20 else e50
+    orders: List[Order] = []
+    variant = f"{rule}_{trend}_pb{pullback_ema}_sl{sl_mode}_rr{rr}"
+    if trail:
+        variant += "_trail"
+
+    for i in range(220, n - 1):
+        ts = times[i]
+        if ts.dayofweek >= 5:
+            continue
+        # session filter London+NY roughly
+        h = ts.hour
+        if not (6 <= h < 20):
+            continue
+        atr_i = a.iloc[i]
+        if np.isnan(atr_i) or atr_i <= 0:
+            continue
+        # trend
+        if trend == "ema50_200":
+            up = float(e50.iloc[i]) > float(e200.iloc[i]) and float(close[i]) > float(e50.iloc[i])
+            dn = float(e50.iloc[i]) < float(e200.iloc[i]) and float(close[i]) < float(e50.iloc[i])
+        else:
+            # slope of EMA50 over 5 bars
+            if i < 5:
+                continue
+            slope = float(e50.iloc[i] - e50.iloc[i - 5])
+            up = slope > 0.15 * float(atr_i) and float(close[i]) > float(e50.iloc[i])
+            dn = slope < -0.15 * float(atr_i) and float(close[i]) < float(e50.iloc[i])
+        if not (up or dn):
+            continue
+        pb_v = float(pb.iloc[i])
+        # pullback touch: low <= ema <= high on this bar, rejection close
+        if up:
+            if not (low[i] <= pb_v <= high[i]):
+                continue
+            if not bull[i]:
+                continue
+            if close[i] < pb_v:  # must reclaim
+                continue
+            # rejection: close in upper half
+            if close[i] < (high[i] + low[i]) / 2:
+                continue
+            entry = float(close[i])
+            if sl_mode == "swing":
+                sl = float(min(low[i], low[i - 1])) - 0.05 * float(atr_i)
+            else:
+                sl = entry - 1.0 * float(atr_i)
+            risk = entry - sl
+            if risk < 0.08 or risk > 4 * float(atr_i):
+                continue
+            tp = entry + rr * risk
+            side = "long"
+        else:
+            if not (low[i] <= pb_v <= high[i]):
+                continue
+            if not bear[i]:
+                continue
+            if close[i] > pb_v:
+                continue
+            if close[i] > (high[i] + low[i]) / 2:
+                continue
+            entry = float(close[i])
+            if sl_mode == "swing":
+                sl = float(max(high[i], high[i - 1])) + 0.05 * float(atr_i)
+            else:
+                sl = entry + 1.0 * float(atr_i)
+            risk = sl - entry
+            if risk < 0.08 or risk > 4 * float(atr_i):
+                continue
+            tp = entry - rr * risk
+            side = "short"
+
+        arm = bar_end(ts, bar_min)
+        hold = int(12 * 60 / (bar_min / 60)) if trail else None  # ~12h trail proxy via time if trail
+        # trailing approximated as 2R TP when not trail; when trail use 3R + max hold
+        if trail:
+            tp = entry + 3 * risk if side == "long" else entry - 3 * risk
+            hold = int(16 * 60)  # 16h max
+        orders.append(Order(
+            arm_time=arm, side=side, kind="market", price=entry, sl=sl, tp=tp,
+            strategy="EMA_PB", variant=variant, meta={"signal_bar": ts},
+            expire_minutes=bar_min * 2, max_hold_minutes=hold,
+        ))
+
+    orders = dedupe_orders(orders, bar_min * 3)
+    return apply_dxy_gate(orders, dxy, use_dxy)
+
+
+##### FILE: src/strategies/fib78_limit.py #####
+"""fib78_limit (beny.trade): trend (HH/HL or LH/LL) → impulse swing → limit @ 0.78, SL beyond 1.0, TP @ 0.0.
+
+Log-scale Fib irrelevant intraday on gold (linear only). First-touch only; invalidate if price
+exceeds 1.0 before fill. Fractal sizes / TFs: M5 M15 H1 H2.
+Difference vs losing NDS Fib zone test: exact 0.78 limit (not zone+engulf), SL beyond 1.0, TP at 0.0 (~3.5R).
+"""
+from __future__ import annotations
+import numpy as np
+import pandas as pd
+from typing import Dict, List, Optional, Tuple
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from engine import Order
+from indicators import atr_prior, resample_ohlc, bar_end
+from strategies.common import dedupe_orders
+from strategies.ict_helpers import swing_highs_lows
+
+
+def _trend(shi, sli, h, l, i) -> Optional[str]:
+    """HH/HL → bull, LH/LL → bear. Need 2 swings each."""
+    ph = [s for s in shi if s < i]
+    pl = [s for s in sli if s < i]
+    if len(ph) < 2 or len(pl) < 2:
+        return None
+    if h[ph[-1]] > h[ph[-2]] and l[pl[-1]] > l[pl[-2]]:
+        return "long"
+    if h[ph[-1]] < h[ph[-2]] and l[pl[-1]] < l[pl[-2]]:
+        return "short"
+    return None
+
+
+def generate_fib78_limit(
+    m1: pd.DataFrame,
+    swing_tf: str = "M15",   # M5 | M15 | H1 | H2
+    fractal: int = 2,        # left/right for swings
+    atr_buf: float = 0.1,
+    first_touch_only: bool = True,
+) -> List[Order]:
+    bar_m = {"M5": 5, "M15": 15, "H1": 60, "H2": 120}[swing_tf]
+    df = resample_ohlc(m1, f"{bar_m}min")
+    h, l, c = df["high"].values, df["low"].values, df["close"].values
+    times = df.index
+    n = len(df)
+    a = atr_prior(df, 14).values
+    shi, sli = swing_highs_lows(h, l, fractal, fractal)
+
+    tag = "ft1" if first_touch_only else "any"
+    variant = f"fib78_{swing_tf}_fr{fractal}_{tag}"
+    orders: List[Order] = []
+
+    # Walk confirmed swings: when a new swing extreme confirms, define impulse
+    # Confirmation at swing_i + fractal
+    for idx, sw in enumerate(shi):
+        conf = sw + fractal
+        if conf >= n - 1:
+            continue
+        trend = _trend(shi, sli, h, l, conf)
+        if trend != "short":
+            continue
+        # impulse = swing high that made new extreme (this SH) from prior SL
+        pl = [s for s in sli if s < sw]
+        if not pl:
+            continue
+        sl_i = pl[-1]
+        leg_start = float(l[sl_i])  # wait — for short impulse: start=high (1.0), end=low (0.0)
+        # Short setup after bearish impulse: impulse was down from high to low
+        # Actually beny: trend LH/LL, impulse = swing that made new extreme (new LL),
+        # Fib from start of that impulse leg (prior swing high=1.0) to new low=0.0, limit buy? 
+        # For shorts in downtrend: impulse down, retrace to 0.78, sell.
+        # leg: 1.0 = swing high (start), 0.0 = new swing low (end)
+        # But this SH is the start if we're looking at a completed down move ending at a SL.
+        pass
+
+    # Cleaner pass: on each confirmed swing low in downtrend → short retrace setup
+    # on each confirmed swing high in uptrend → long retrace setup
+    for sw in sli:
+        conf = sw + fractal
+        if conf >= n - 1 or conf < 5:
+            continue
+        if int(getattr(times[conf], "day_of_week", times[conf].dayofweek)) >= 5:
+            continue
+        trend = _trend(shi, sli, h, l, conf)
+        if trend != "short":
+            continue
+        # impulse end = this SL; start = last SH before it
+        ph = [s for s in shi if s < sw]
+        if not ph:
+            continue
+        sh_i = ph[-1]
+        p10 = float(h[sh_i])  # Fib 1.0
+        p00 = float(l[sw])    # Fib 0.0
+        move = p10 - p00
+        atr_v = a[conf]
+        if np.isnan(atr_v) or atr_v <= 0 or move < 1.2 * atr_v:
+            continue
+        p78 = p00 + 0.78 * move
+        buf = max(atr_buf * atr_v, 0.15)
+        sl = p10 + buf
+        tp = p00
+        risk = abs(p78 - sl)
+        if risk < 0.3 or abs(tp - p78) / risk < 1.5:
+            continue
+        # arm at confirmation; limit sell at 0.78; expire until invalidation (price > 1.0)
+        # expire_minutes: until end of next few bars — use price invalidation via expire window
+        # Engine doesn't support invalidate-on-price; approximate expire 8h and skip if 1.0 already pierced before arm
+        if float(np.max(h[sw:conf + 1])) > p10:
+            continue  # invalidated during confirm
+        arm = bar_end(times[conf], bar_m)
+        # first touch: only one order per impulse
+        orders.append(Order(
+            arm_time=arm, side="short", kind="limit", price=float(p78),
+            sl=float(sl), tp=float(tp),
+            strategy="Fib78Limit", variant=variant,
+            meta={"p10": p10, "p00": p00, "p78": p78, "first_touch": first_touch_only},
+            expire_minutes=bar_m * 40, max_hold_minutes=bar_m * 80,
+        ))
+
+    for sw in shi:
+        conf = sw + fractal
+        if conf >= n - 1 or conf < 5:
+            continue
+        if int(getattr(times[conf], "day_of_week", times[conf].dayofweek)) >= 5:
+            continue
+        trend = _trend(shi, sli, h, l, conf)
+        if trend != "long":
+            continue
+        pl = [s for s in sli if s < sw]
+        if not pl:
+            continue
+        sl_i = pl[-1]
+        p10 = float(l[sl_i])
+        p00 = float(h[sw])
+        move = p00 - p10
+        atr_v = a[conf]
+        if np.isnan(atr_v) or atr_v <= 0 or move < 1.2 * atr_v:
+            continue
+        p78 = p00 - 0.78 * move
+        buf = max(atr_buf * atr_v, 0.15)
+        sl = p10 - buf
+        tp = p00
+        risk = abs(p78 - sl)
+        if risk < 0.3 or abs(tp - p78) / risk < 1.5:
+            continue
+        if float(np.min(l[sw:conf + 1])) < p10:
+            continue
+        arm = bar_end(times[conf], bar_m)
+        orders.append(Order(
+            arm_time=arm, side="long", kind="limit", price=float(p78),
+            sl=float(sl), tp=float(tp),
+            strategy="Fib78Limit", variant=variant,
+            meta={"p10": p10, "p00": p00, "p78": p78, "note": "linear fib; log-scale N/A intraday XAU"},
+            expire_minutes=bar_m * 40, max_hold_minutes=bar_m * 80,
+        ))
+
+    oo = dedupe_orders(orders, 30)
+    if first_touch_only:
+        # already one per swing; dedupe handles clustering
+        pass
+    return oo
+
+
+def generate_fib78_family(m1: pd.DataFrame) -> Dict[str, List[Order]]:
+    pools = {}
+    for tf in ("M5", "M15", "H1", "H2"):
+        for fr in (2, 3):
+            for ft in (True, False):
+                print(f" fib78 {tf} fr{fr} ft{ft}", flush=True)
+                oo = generate_fib78_limit(m1, tf, fr, first_touch_only=ft)
+                if oo:
+                    pools[oo[0].variant] = oo
+                    print(f"  n={len(oo)}", flush=True)
+    return pools
+
+
+##### FILE: src/strategies/fib_ote_fvg.py #####
+"""fib_ote_fvg (mehraninvest): BOS impulse → Fib 1.0→0.0 → FVG/OB in 0.62–0.78 → limit entry.
+
+Reuses zone math from nds_fib._zone_bounds. Differences vs prior losing NDS Fib 0.62–0.78:
+  - requires BOS (close beyond prior swing) to define the impulse leg
+  - requires FVG (or OB) *inside* the OTE zone (not just price in zone + engulf)
+  - limit at FVG edge/mid/0.62 (not market engulf)
+  - SL: beyond 0.78+buf OR beyond 1.0; TP at 0.0 or fixed RR2/3
+"""
+from __future__ import annotations
+import numpy as np
+import pandas as pd
+from typing import Dict, List, Tuple
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from engine import Order
+from indicators import atr_prior, resample_ohlc, bar_end
+from strategies.common import dedupe_orders
+from strategies.ict_helpers import find_fvgs, swing_highs_lows, last_swing_before
+from strategies.nds_fib import _zone_bounds
+
+
+def _ob_in_zone(o, h, l, c, i_start, i_end, side, z_lo, z_hi):
+    """Last opposing candle (OB proxy) whose body overlaps zone."""
+    for k in range(i_end, i_start, -1):
+        if side == "long" and c[k] < o[k]:  # bearish OB in bullish retrace
+            blo, bhi = c[k], o[k]
+            if blo <= z_hi and bhi >= z_lo:
+                return float(blo), float(bhi), k
+        if side == "short" and c[k] > o[k]:
+            blo, bhi = o[k], c[k]
+            if blo <= z_hi and bhi >= z_lo:
+                return float(blo), float(bhi), k
+    return None
+
+
+def generate_fib_ote_fvg(
+    m1: pd.DataFrame,
+    entry_tf: str = "M5",
+    structure_tf: str = "M15",
+    zone_obj: str = "fvg",       # fvg | ob
+    entry_at: str = "mid",       # mid | edge | fib062
+    sl_mode: str = "beyond78",   # beyond78 | beyond10
+    tp_mode: str = "fib0",       # fib0 | rr2 | rr3
+    swing_lr: int = 2,
+    atr_buf: float = 0.1,
+) -> List[Order]:
+    bar_m = {"M1": 1, "M5": 5, "M15": 15}[entry_tf]
+    st_m = {"M5": 5, "M15": 15, "H1": 60}[structure_tf]
+    df = m1 if entry_tf == "M1" else resample_ohlc(m1, f"{bar_m}min")
+    st = resample_ohlc(m1, f"{st_m}min") if structure_tf != entry_tf else df
+
+    # Structure swings on structure TF
+    sh, sl_ = st["high"].values, st["low"].values
+    sc, so = st["close"].values, st["open"].values
+    st_times = st.index
+    st_atr = atr_prior(st, 14).values
+    shi, sli = swing_highs_lows(sh, sl_, swing_lr, swing_lr)
+
+    # Entry TF arrays
+    o, h, l, c = df["open"].values, df["high"].values, df["low"].values, df["close"].values
+    times = df.index
+    a = atr_prior(df, 14).values
+    n = len(df)
+
+    variant = f"fibote_{structure_tf}_{entry_tf}_{zone_obj}_{entry_at}_{sl_mode}_{tp_mode}"
+    orders: List[Order] = []
+    used = set()
+
+    # Map entry bars to structure index
+    st_pos = st_times.searchsorted(times, side="right") - 1
+
+    for si in range(20, len(st) - 1):
+        atr_s = st_atr[si]
+        if np.isnan(atr_s) or atr_s <= 0:
+            continue
+        # BOS long: close above last swing high
+        side = None
+        leg_start = leg_end = None  # price: for long, start=swing low, end=swing high (BOS)
+        sw_h = last_swing_before(shi, si)
+        sw_l = last_swing_before(sli, si)
+        if sw_h is not None and sc[si] > sh[sw_h] and sc[si] > so[si]:
+            # impulse low = last swing low before BOS
+            if sw_l is not None and sw_l < sw_h:
+                side = "long"
+                leg_start = float(sl_[sw_l])  # Fib 1.0
+                leg_end = float(sh[sw_h])     # Fib 0.0 (or BOS high)
+                leg_end = max(leg_end, float(sh[si]))
+        if side is None and sw_l is not None and sc[si] < sl_[sw_l] and sc[si] < so[si]:
+            if sw_h is not None and sw_h < sw_l:
+                side = "short"
+                leg_start = float(sh[sw_h])  # Fib 1.0
+                leg_end = float(sl_[sw_l])
+                leg_end = min(leg_end, float(sl_[si]))
+        if side is None:
+            continue
+        move = abs(leg_end - leg_start)
+        if move < 1.2 * atr_s:
+            continue
+
+        # Fib: 1.0 at leg_start, 0.0 at leg_end
+        if side == "long":
+            # prices: 1.0 = low (start), 0.0 = high (end)
+            swing_low, swing_high = leg_start, leg_end
+            z_lo, z_hi = _zone_bounds("long", swing_high, swing_low, 0.62, 0.78)
+            p78 = swing_high - 0.78 * move
+            p62 = swing_high - 0.62 * move
+            p10 = swing_low  # 1.0
+            p00 = swing_high  # 0.0
+        else:
+            swing_low, swing_high = leg_end, leg_start
+            z_lo, z_hi = _zone_bounds("short", swing_high, swing_low, 0.62, 0.78)
+            p78 = swing_low + 0.78 * move
+            p62 = swing_low + 0.62 * move
+            p10 = swing_high
+            p00 = swing_low
+
+        # Search entry TF after structure bar end for FVG/OB in zone
+        arm0 = bar_end(st_times[si], st_m)
+        i0 = times.searchsorted(arm0, side="left")
+        i1 = times.searchsorted(arm0 + pd.Timedelta(hours=6), side="left")
+        if i0 >= n - 2:
+            continue
+
+        for i in range(max(i0, 10), min(i1, n - 1)):
+            if int(getattr(times[i], "day_of_week", times[i].dayofweek)) >= 5:
+                continue
+            atr_v = a[i]
+            if np.isnan(atr_v) or atr_v <= 0:
+                continue
+            key = (st_times[si], side)
+            if key in used:
+                break
+
+            if zone_obj == "fvg":
+                fvgs = find_fvgs(h, l, a, max(i - 10, 0), i, "bull" if side == "long" else "bear", 0.05)
+                # FVG overlapping OTE zone
+                hit = None
+                for glo, ghi, fi in fvgs:
+                    if glo <= z_hi and ghi >= z_lo:
+                        hit = (glo, ghi)
+                if hit is None:
+                    continue
+                glo, ghi = hit
+            else:
+                ob = _ob_in_zone(o, h, l, c, max(i - 15, 0), i, side, z_lo, z_hi)
+                if ob is None:
+                    continue
+                glo, ghi, _ = ob
+
+            # entry price
+            if entry_at == "mid":
+                px = 0.5 * (glo + ghi)
+            elif entry_at == "edge":
+                px = ghi if side == "long" else glo  # near premium/discount edge of gap
+            else:  # fib062
+                px = p62
+            # must be in zone
+            if not (z_lo - 0.05 <= px <= z_hi + 0.05):
+                continue
+
+            buf = max(atr_buf * atr_v, 0.12)
+            if sl_mode == "beyond78":
+                sl = (p78 - buf) if side == "long" else (p78 + buf)
+            else:
+                sl = (p10 - buf) if side == "long" else (p10 + buf)
+            if (side == "long" and sl >= px) or (side == "short" and sl <= px):
+                continue
+            risk = abs(px - sl)
+            if risk < 0.25:
+                continue
+
+            if tp_mode == "fib0":
+                tp = p00
+                if abs(tp - px) / risk < 1.0:
+                    continue
+            elif tp_mode == "rr2":
+                tp = px + 2 * risk if side == "long" else px - 2 * risk
+            else:
+                tp = px + 3 * risk if side == "long" else px - 3 * risk
+
+            arm = bar_end(times[i], bar_m)
+            orders.append(Order(
+                arm_time=arm, side=side, kind="limit", price=float(px),
+                sl=float(sl), tp=float(tp),
+                strategy="FibOTEFVG", variant=variant,
+                meta={"z": (z_lo, z_hi), "leg": (leg_start, leg_end)},
+                expire_minutes=120, max_hold_minutes=480,
+            ))
+            used.add(key)
+            break
+
+    return dedupe_orders(orders, 40)
+
+
+def generate_fib_ote_family(m1: pd.DataFrame) -> Dict[str, List[Order]]:
+    """Focused grid vs prior NDS Fib loss: BOS+FVG/OB in OTE, limit entry, SL/TP variants."""
+    pools = {}
+    grid = [
+        # structure, entry, zone_obj, entry_at, sl_mode, tp_mode
+        ("M15", "M5", "fvg", "mid", "beyond78", "fib0"),
+        ("M15", "M5", "fvg", "mid", "beyond78", "rr2"),
+        ("M15", "M5", "fvg", "mid", "beyond78", "rr3"),
+        ("M15", "M5", "fvg", "mid", "beyond10", "fib0"),
+        ("M15", "M5", "fvg", "mid", "beyond10", "rr2"),
+        ("M15", "M5", "fvg", "edge", "beyond78", "fib0"),
+        ("M15", "M5", "fvg", "edge", "beyond10", "fib0"),
+        ("M15", "M5", "fvg", "fib062", "beyond78", "fib0"),
+        ("M15", "M5", "fvg", "fib062", "beyond10", "rr2"),
+        ("M15", "M5", "ob", "mid", "beyond78", "fib0"),
+        ("M15", "M5", "ob", "mid", "beyond10", "rr2"),
+        ("M15", "M5", "ob", "edge", "beyond78", "fib0"),
+        ("M15", "M15", "fvg", "mid", "beyond78", "fib0"),
+        ("M15", "M15", "fvg", "mid", "beyond10", "rr2"),
+        ("M15", "M15", "fvg", "edge", "beyond78", "fib0"),
+        ("H1", "M5", "fvg", "mid", "beyond78", "fib0"),
+        ("H1", "M5", "fvg", "mid", "beyond10", "rr2"),
+        ("H1", "M5", "fvg", "edge", "beyond78", "fib0"),
+        ("H1", "M5", "ob", "mid", "beyond78", "fib0"),
+        ("H1", "M15", "fvg", "mid", "beyond78", "fib0"),
+        ("H1", "M15", "fvg", "mid", "beyond10", "rr3"),
+    ]
+    for stf, etf, zobj, ent, slm, tp in grid:
+        print(f" fibote {stf} {etf} {zobj} {ent} {slm} {tp}", flush=True)
+        oo = generate_fib_ote_fvg(m1, etf, stf, zobj, ent, slm, tp)
+        if oo:
+            pools[oo[0].variant] = oo
+            print(f"  n={len(oo)}", flush=True)
+    return pools
+
+
+##### FILE: src/strategies/gartley_textbook.py #####
+"""gartley_textbook: classic Gartley via zigzag pivots.
+AB=0.618 XA, BC 0.382–0.886 AB, D=0.786 XA (also 1.27–1.618 BC alt);
+limit at D, SL beyond X / buf beyond D; TP 0.382/0.618 AD. M5/M15/H1.
+"""
+from __future__ import annotations
+import numpy as np
+import pandas as pd
+from typing import Dict, List
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from engine import Order
+from indicators import atr_prior, resample_ohlc, bar_end
+from strategies.common import dedupe_orders
+from strategies.batch2_helpers import zigzag_pivots
+
+
+def _near(x, target, tol):
+    return abs(x - target) <= tol
+
+
+def generate_gartley(
+    m1: pd.DataFrame,
+    tf: str = "M15",
+    pivot: int = 3,
+    tol: float = 0.08,
+    d_mode: str = "xa786",   # xa786 | bc_ext
+    sl_mode: str = "beyond_x",  # beyond_x | buf_d
+    tp_fib: float = 0.618,   # of AD
+) -> List[Order]:
+    bar = {"M5": 5, "M15": 15, "H1": 60}[tf]
+    df = resample_ohlc(m1, f"{bar}min")
+    h, l, c = df["high"].values, df["low"].values, df["close"].values
+    times = df.index
+    a = atr_prior(df, 14).values
+    piv = zigzag_pivots(h, l, c, pivot, pivot)
+    variant = f"gartley_{tf}_p{pivot}_t{tol:g}_{d_mode}_sl{sl_mode}_tp{tp_fib:g}"
+    orders: List[Order] = []
+
+    for k in range(4, len(piv)):
+        # need X A B C then D forming / confirmed as next pivot
+        X, A, B, C = piv[k - 4], piv[k - 3], piv[k - 2], piv[k - 1]
+        # bullish Gartley: X low, A high, B low, C high, D low
+        bull = X[2] == "L" and A[2] == "H" and B[2] == "L" and C[2] == "H"
+        bear = X[2] == "H" and A[2] == "L" and B[2] == "H" and C[2] == "L"
+        if not (bull or bear):
+            continue
+        XA = abs(A[1] - X[1])
+        AB = abs(B[1] - A[1])
+        BC = abs(C[1] - B[1])
+        if XA < 1e-6 or AB < 1e-6:
+            continue
+        if not _near(AB / XA, 0.618, tol):
+            continue
+        r_bc = BC / AB
+        if not (0.382 - tol <= r_bc <= 0.886 + tol):
+            continue
+
+        # Expected D
+        if bull:
+            d_xa = A[1] - 0.786 * XA
+            d_bc_lo = B[1] - 1.618 * BC
+            d_bc_hi = B[1] - 1.27 * BC
+        else:
+            d_xa = A[1] + 0.786 * XA
+            d_bc_lo = B[1] + 1.27 * BC
+            d_bc_hi = B[1] + 1.618 * BC
+
+        if d_mode == "xa786":
+            d_price = d_xa
+        else:
+            d_price = 0.5 * (d_bc_lo + d_bc_hi)
+
+        # D confirmed as next pivot after C matching type
+        D = piv[k]
+        if bull and D[2] != "L":
+            continue
+        if bear and D[2] != "H":
+            continue
+        if not _near(D[1], d_price, tol * XA):
+            # also accept if D near xa786 OR within BC ext band
+            ok = _near(D[1], d_xa, tol * XA)
+            if bull:
+                ok = ok or (d_bc_lo - tol * XA <= D[1] <= d_bc_hi + tol * XA)
+            else:
+                ok = ok or (d_bc_lo - tol * XA <= D[1] <= d_bc_hi + tol * XA)
+            if d_mode == "bc_ext":
+                ok = (min(d_bc_lo, d_bc_hi) - tol * XA <= D[1] <= max(d_bc_lo, d_bc_hi) + tol * XA)
+            if not ok:
+                continue
+
+        conf = D[0] + pivot  # confirmation bar
+        if conf >= len(times) - 1:
+            continue
+        if int(getattr(times[conf], "day_of_week", times[conf].dayofweek)) >= 5:
+            continue
+        atr_v = a[conf]
+        if np.isnan(atr_v) or atr_v <= 0:
+            continue
+
+        side = "long" if bull else "short"
+        px = float(D[1])
+        buf = max(0.15 * atr_v, 0.15)
+        if sl_mode == "beyond_x":
+            sl = float(X[1]) - buf if bull else float(X[1]) + buf
+        else:
+            sl = px - buf if bull else px + buf
+        if (bull and sl >= px) or (not bull and sl <= px):
+            continue
+        risk = abs(px - sl)
+        if risk < 0.25:
+            continue
+        # TP along AD
+        AD = abs(D[1] - A[1])
+        if bull:
+            tp = D[1] + tp_fib * AD
+        else:
+            tp = D[1] - tp_fib * AD
+        if abs(tp - px) / risk < 1.0:
+            continue
+
+        arm = bar_end(times[conf], bar)
+        orders.append(Order(
+            arm_time=arm, side=side, kind="limit", price=float(px),
+            sl=float(sl), tp=float(tp),
+            strategy="Gartley", variant=variant,
+            meta={"X": X[1], "A": A[1], "B": B[1], "C": C[1], "D": D[1]},
+            expire_minutes=bar * 30, max_hold_minutes=bar * 80,
+        ))
+
+    return dedupe_orders(orders, bar * 2)
+
+
+def generate_gartley_family(m1: pd.DataFrame) -> Dict[str, List[Order]]:
+    pools = {}
+    for tf in ("M5", "M15", "H1"):
+        for piv in (2, 3, 5):
+            for tol in (0.06, 0.10):
+                for dm in ("xa786", "bc_ext"):
+                    for slm in ("beyond_x", "buf_d"):
+                        for tp in (0.382, 0.618):
+                            # prune
+                            if piv == 5 and tf == "M5" and tol == 0.06:
+                                continue
+                            if dm == "bc_ext" and slm == "buf_d" and tp == 0.382:
+                                continue
+                            print(f" gartley {tf} p{piv} t{tol} {dm} {slm} tp{tp}", flush=True)
+                            oo = generate_gartley(m1, tf, piv, tol, dm, slm, tp)
+                            if oo:
+                                pools[oo[0].variant] = oo
+                                print(f"  n={len(oo)}", flush=True)
+    return pools
+
+
+##### FILE: src/strategies/h4open_fvg.py #####
+"""H4-open FVG: bias from previous CLOSED H4 direction (no lookahead on forming H4).
+Bull: price sweeps below H4 open (of current forming H4), M15/M5 swing low swept, bullish BOS/MSS,
+limit at FVG of impulse, SL at sweep, TP 1:2. Mirror bear.
+"""
+from __future__ import annotations
+import numpy as np
+import pandas as pd
+from typing import Dict, List
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from engine import Order
+from indicators import atr_prior, resample_ohlc, bar_end
+from strategies.common import dedupe_orders
+from strategies.ict_helpers import find_fvgs, swing_highs_lows, last_swing_before
+
+
+def generate_h4open_fvg(
+    m1: pd.DataFrame,
+    entry_tf: str = "M15",   # M15 | M5
+    rr: float = 2.0,
+    bias_mode: str = "prev_h4",  # prev_h4 | side_of_open
+    atr_buf: float = 0.15,
+) -> List[Order]:
+    bar_m = 15 if entry_tf == "M15" else 5
+    df = resample_ohlc(m1, f"{bar_m}min")
+    h4 = resample_ohlc(m1, "4h")
+    o, h, l, c = df["open"].values, df["high"].values, df["low"].values, df["close"].values
+    times = df.index
+    n = len(df)
+    a = atr_prior(df, 14).values
+    shi, sli = swing_highs_lows(h, l, 2, 2)
+
+    h4_o = h4["open"].values
+    h4_c = h4["close"].values
+    h4_h = h4["high"].values
+    h4_l = h4["low"].values
+    h4_t = h4.index
+
+    variant = f"h4open_{entry_tf}_{bias_mode}_rr{rr}"
+    orders: List[Order] = []
+    used = set()
+
+    # map each LTF bar to current forming H4 index and previous closed H4
+    h4_pos = h4_t.searchsorted(times, side="right") - 1
+
+    for i in range(30, n - 1):
+        ts = times[i]
+        if int(getattr(ts, "day_of_week", ts.dayofweek)) >= 5:
+            continue
+        hi = int(h4_pos[i])
+        if hi < 1:
+            continue
+        # previous closed H4 = hi-1 (current forming is hi, not fully closed)
+        # Confirm hi is still forming: times[i] < h4_t[hi] + 4h
+        if times[i] >= h4_t[hi] + pd.Timedelta(hours=4):
+            continue
+        atr_v = a[i]
+        if np.isnan(atr_v) or atr_v <= 0:
+            continue
+
+        prev = hi - 1
+        cur_open = float(h4_o[hi])
+        # bias
+        if bias_mode == "prev_h4":
+            if h4_c[prev] > h4_o[prev]:
+                bias = "long"
+            elif h4_c[prev] < h4_o[prev]:
+                bias = "short"
+            else:
+                continue
+        else:  # side_of_open at sweep time — still uses only closed LTF info
+            # require trade on bullish side of open for long setups etc. applied below
+            bias = None  # determined by sweep side relative to open
+
+        key = (h4_t[hi],)
+        if key in used:
+            continue
+
+        side = None
+        swept = None
+        # bull: price below H4 open, sweep swing low, close back above swept low (MSS reclaim)
+        if (bias == "long" or bias_mode == "side_of_open") and l[i] < cur_open:
+            sw = last_swing_before(sli, i)
+            if sw is not None and l[i] < l[sw] and c[i] > l[sw] and c[i] > o[i]:
+                if bias == "long" or bias_mode == "side_of_open":
+                    side = "long"
+                    swept = float(min(l[i], l[sw]))
+        if side is None and (bias == "short" or bias_mode == "side_of_open") and h[i] > cur_open:
+            sw = last_swing_before(shi, i)
+            if sw is not None and h[i] > h[sw] and c[i] < h[sw] and c[i] < o[i]:
+                side = "short"
+                swept = float(max(h[i], h[sw]))
+        if side is None or swept is None:
+            continue
+        # for prev_h4 bias, enforce matching direction
+        if bias_mode == "prev_h4" and bias is not None and side != bias:
+            continue
+
+        # FVG of impulse (last few bars)
+        fdir = "bull" if side == "long" else "bear"
+        fvgs = find_fvgs(h, l, a, max(i - 8, 0), i, fdir, min_atr=0.05)
+        if not fvgs:
+            continue
+        glo, ghi, _ = fvgs[-1]
+        px = 0.5 * (glo + ghi)
+        buf = max(atr_buf * atr_v, 0.12)
+        if side == "long":
+            sl = min(swept, glo) - buf
+            if sl >= px:
+                continue
+        else:
+            sl = max(swept, ghi) + buf
+            if sl <= px:
+                continue
+        risk = abs(px - sl)
+        if risk < 0.20:
+            continue
+        tp = px + rr * risk if side == "long" else px - rr * risk
+        arm = bar_end(ts, bar_m)
+        orders.append(Order(
+            arm_time=arm, side=side, kind="limit", price=float(px),
+            sl=float(sl), tp=float(tp),
+            strategy="H4OpenFVG", variant=variant,
+            meta={"h4_open": cur_open, "h4_start": str(h4_t[hi])},
+            expire_minutes=90, max_hold_minutes=360,
+        ))
+        used.add(key)
+
+    return dedupe_orders(orders, 40)
+
+
+def generate_h4open_family(m1: pd.DataFrame) -> Dict[str, List[Order]]:
+    pools = {}
+    for tf in ("M15", "M5"):
+        for bias in ("prev_h4", "side_of_open"):
+            for rr in (2.0, 1.5):
+                print(f" h4open {tf} {bias} rr{rr}", flush=True)
+                oo = generate_h4open_fvg(m1, entry_tf=tf, rr=rr, bias_mode=bias)
+                if oo:
+                    pools[oo[0].variant] = oo
+                    print(f"  n={len(oo)}", flush=True)
+    return pools
+
+
+def overlap_with_session_box(h4_orders: List[Order], box_orders: List[Order], window_min=60) -> dict:
+    """Count H4Open signals that also have a SessionBox signal within window."""
+    if not h4_orders or not box_orders:
+        return {"h4_n": len(h4_orders), "box_n": len(box_orders), "overlap": 0, "pct": 0.0}
+    box_t = sorted([o.arm_time for o in box_orders])
+    ov = 0
+    for o in h4_orders:
+        for bt in box_t:
+            if abs((o.arm_time - bt).total_seconds()) <= window_min * 60 and o.side == "long":  # rough
+                # better: same side
+                pass
+    # side-aware
+    box_by_side = {"long": [o.arm_time for o in box_orders if o.side == "long"],
+                   "short": [o.arm_time for o in box_orders if o.side == "short"]}
+    ov = 0
+    for o in h4_orders:
+        for bt in box_by_side.get(o.side, []):
+            if abs((o.arm_time - bt).total_seconds()) <= window_min * 60:
+                ov += 1
+                break
+    return {"h4_n": len(h4_orders), "box_n": len(box_orders), "overlap": ov,
+            "pct": ov / len(h4_orders) if h4_orders else 0.0}
+
+
+##### FILE: src/strategies/hougaard_daily.py #####
+"""Tom Hougaard (fundex24) daily continuation rules.
+
+Broker day = UTC calendar day (same as rest of engine / Dukascopy M1).
+Rule A bear: Fri high < Thu high → Mon target = Fri low. Bull mirror: Fri low > Thu low → Mon target Fri high.
+Rule B bear: Wed high < Mon high (Tue ignored) → Thu target = Wed low. Bull mirror similarly.
+Stats: touch frequency of target on target day vs baseline prior-day extreme touch.
+Tradable: on target day, after M5/M15 swing sweep of recent high (for shorts), MSS/engulf confirm,
+SL above sweep, TP=target or fixed RR with target as filter.
+"""
+from __future__ import annotations
+import numpy as np
+import pandas as pd
+from typing import Dict, List, Tuple, Optional
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from engine import Order
+from indicators import atr_prior, resample_ohlc, bar_end, bullish_engulfing, bearish_engulfing
+from strategies.common import dedupe_orders
+from strategies.ict_helpers import swing_highs_lows, last_swing_before
+
+
+def _daily_ohlc(m1: pd.DataFrame) -> pd.DataFrame:
+    """UTC day bars — broker day boundary for this project."""
+    return resample_ohlc(m1, "1D")
+
+
+def hougaard_signals(daily: pd.DataFrame) -> List[dict]:
+    """Emit {target_date, side, target_px, rule, cond_high/low...} for each applicable setup."""
+    # index is day start UTC
+    rows = []
+    by_date = {ts.date(): (ts, float(r.high), float(r.low), float(r.open), float(r.close))
+               for ts, r in daily.iterrows()}
+    dates = sorted(by_date.keys())
+    # map date -> weekday 0=Mon
+    for i, d in enumerate(dates):
+        ts, h, l, o, c = by_date[d]
+        wd = ts.day_of_week if hasattr(ts, "day_of_week") else ts.dayofweek
+        # Rule A: need Fri setup → Monday target. Look at Friday bars.
+        if wd == 4:  # Friday
+            # find Thursday
+            thu = None
+            for j in range(i - 1, max(-1, i - 5), -1):
+                t2 = list(by_date.keys())[j] if False else dates[j]
+                ts2 = by_date[dates[j]][0]
+                if (ts2.day_of_week if hasattr(ts2, "day_of_week") else ts2.dayofweek) == 3:
+                    thu = dates[j]; break
+            if thu is not None:
+                _, th, tl, _, _ = by_date[thu]
+                # next Monday
+                mon = None
+                for j in range(i + 1, min(len(dates), i + 4)):
+                    ts2 = by_date[dates[j]][0]
+                    if (ts2.day_of_week if hasattr(ts2, "day_of_week") else ts2.dayofweek) == 0:
+                        mon = dates[j]; break
+                if mon is not None:
+                    if h < th:
+                        rows.append({"target_date": mon, "side": "short", "target_px": l,
+                                     "rule": "A", "setup_date": d, "ref_high": th, "setup_high": h, "setup_low": l})
+                    if l > tl:
+                        rows.append({"target_date": mon, "side": "long", "target_px": h,
+                                     "rule": "A", "setup_date": d, "ref_low": tl, "setup_high": h, "setup_low": l})
+        # Rule B: Wed vs Mon → Thursday target
+        if wd == 2:  # Wednesday
+            mon = None
+            for j in range(i - 1, max(-1, i - 5), -1):
+                ts2 = by_date[dates[j]][0]
+                if (ts2.day_of_week if hasattr(ts2, "day_of_week") else ts2.dayofweek) == 0:
+                    mon = dates[j]; break
+            thu = None
+            for j in range(i + 1, min(len(dates), i + 4)):
+                ts2 = by_date[dates[j]][0]
+                if (ts2.day_of_week if hasattr(ts2, "day_of_week") else ts2.dayofweek) == 3:
+                    thu = dates[j]; break
+            if mon is not None and thu is not None:
+                _, mh, ml, _, _ = by_date[mon]
+                if h < mh:
+                    rows.append({"target_date": thu, "side": "short", "target_px": l,
+                                 "rule": "B", "setup_date": d, "ref_high": mh, "setup_high": h, "setup_low": l})
+                if l > ml:
+                    rows.append({"target_date": thu, "side": "long", "target_px": h,
+                                 "rule": "B", "setup_date": d, "ref_low": ml, "setup_high": h, "setup_low": l})
+    return rows
+
+
+def pure_stats(m1: pd.DataFrame) -> dict:
+    """Touch rates for rules vs baseline prior-day low/high touch."""
+    daily = _daily_ohlc(m1)
+    by_date = {ts.date(): (float(r.high), float(r.low)) for ts, r in daily.iterrows()}
+    sigs = hougaard_signals(daily)
+    out = {"day_boundary": "UTC calendar day (Dukascopy M1 left-labeled 00:00 UTC)", "rules": {}}
+    for rule in ("A", "B"):
+        for side in ("short", "long"):
+            ss = [s for s in sigs if s["rule"] == rule and s["side"] == side]
+            hits = 0
+            for s in ss:
+                td = s["target_date"]
+                if td not in by_date:
+                    continue
+                th, tl = by_date[td]
+                if side == "short" and tl <= s["target_px"]:
+                    hits += 1
+                elif side == "long" and th >= s["target_px"]:
+                    hits += 1
+            key = f"rule{rule}_{side}"
+            out["rules"][key] = {"n": len(ss), "touches": hits,
+                                 "rate": hits / len(ss) if ss else None}
+    # baseline: each day, touch prior-day low / high
+    dates = sorted(by_date.keys())
+    base_lo = base_hi = n = 0
+    for i in range(1, len(dates)):
+        n += 1
+        ph, pl = by_date[dates[i - 1]]
+        h, l = by_date[dates[i]]
+        if l <= pl: base_lo += 1
+        if h >= ph: base_hi += 1
+    out["baseline"] = {
+        "n_days": n,
+        "touch_prior_low": base_lo, "rate_prior_low": base_lo / n if n else None,
+        "touch_prior_high": base_hi, "rate_prior_high": base_hi / n if n else None,
+    }
+    return out
+
+
+def generate_hougaard(
+    m1: pd.DataFrame,
+    rule: str = "B",            # A | B | both
+    side_mode: str = "both",    # short | long | both
+    entry_tf: str = "M5",       # M5 | M15
+    confirm: str = "engulf",    # engulf | mss
+    tp_mode: str = "target",    # target | rr2 (target as filter: must have RR>=1 to target)
+    atr_buf: float = 0.1,
+) -> List[Order]:
+    daily = _daily_ohlc(m1)
+    sigs = hougaard_signals(daily)
+    rules = ("A", "B") if rule == "both" else (rule,)
+    sigs = [s for s in sigs if s["rule"] in rules]
+    if side_mode != "both":
+        sigs = [s for s in sigs if s["side"] == side_mode]
+    # index by target date
+    by_td: Dict = {}
+    for s in sigs:
+        by_td.setdefault(s["target_date"], []).append(s)
+
+    bar_m = 5 if entry_tf == "M5" else 15
+    df = resample_ohlc(m1, f"{bar_m}min")
+    o, h, l, c = df["open"].values, df["high"].values, df["low"].values, df["close"].values
+    times = df.index
+    n = len(df)
+    a = atr_prior(df, 14).values
+    shi, sli = swing_highs_lows(h, l, 2, 2)
+    bull_eng = bullish_engulfing(df).values
+    bear_eng = bearish_engulfing(df).values
+
+    variant = f"hougaard_{rule}_{side_mode}_{entry_tf}_{confirm}_{tp_mode}"
+    orders: List[Order] = []
+    used = set()
+
+    for i in range(20, n - 1):
+        ts = times[i]
+        if int(getattr(ts, "day_of_week", ts.dayofweek)) >= 5:
+            continue
+        day = ts.date()
+        if day not in by_td or day in used:
+            continue
+        atr_v = a[i]
+        if np.isnan(atr_v) or atr_v <= 0:
+            continue
+
+        for s in by_td[day]:
+            side = s["side"]
+            target = s["target_px"]
+            # sweep recent swing
+            if side == "short":
+                sw = last_swing_before(shi, i)
+                if sw is None or h[i] < h[sw]:
+                    continue  # need sweep of swing high this bar
+                # confirmation
+                if confirm == "engulf" and not bear_eng[i]:
+                    continue
+                if confirm == "mss":
+                    # close back below last swing low after sweep — use close < open and close < prior mid
+                    if not (c[i] < o[i] and c[i] < 0.5 * (h[sw] + l[max(sw - 1, 0)])):
+                        continue
+                px = float(c[i])
+                buf = max(atr_buf * atr_v, 0.15)
+                sl = float(h[i]) + buf
+                if sl <= px:
+                    continue
+            else:
+                sw = last_swing_before(sli, i)
+                if sw is None or l[i] > l[sw]:
+                    continue
+                if confirm == "engulf" and not bull_eng[i]:
+                    continue
+                if confirm == "mss":
+                    if not (c[i] > o[i] and c[i] > 0.5 * (h[max(sw - 1, 0)] + l[sw])):
+                        continue
+                px = float(c[i])
+                buf = max(atr_buf * atr_v, 0.15)
+                sl = float(l[i]) - buf
+                if sl >= px:
+                    continue
+
+            risk = abs(px - sl)
+            if risk < 0.20:
+                continue
+            if tp_mode == "target":
+                if side == "short" and target >= px - risk:
+                    continue  # RR<1
+                if side == "long" and target <= px + risk:
+                    continue
+                tp = target
+                rr = abs(tp - px) / risk
+                if rr < 1.0:
+                    continue
+            else:  # rr2 with target as filter (must be able to reach target at least 1R away)
+                if side == "short" and not (target < px - risk):
+                    continue
+                if side == "long" and not (target > px + risk):
+                    continue
+                tp = px - 2 * risk if side == "short" else px + 2 * risk
+
+            arm = bar_end(ts, bar_m)
+            orders.append(Order(
+                arm_time=arm, side=side, kind="market", price=px, sl=float(sl), tp=float(tp),
+                strategy="Hougaard", variant=variant,
+                meta={"rule": s["rule"], "target_date": str(day), "target": target},
+                expire_minutes=20, max_hold_minutes=600,
+            ))
+            used.add(day)
+            break
+
+    return dedupe_orders(orders, 60)
+
+
+def generate_hougaard_family(m1: pd.DataFrame) -> Dict[str, List[Order]]:
+    pools = {}
+    for rule in ("A", "B", "both"):
+        for side in ("both", "short", "long"):
+            for tf in ("M5", "M15"):
+                for conf in ("engulf", "mss"):
+                    for tp in ("target", "rr2"):
+                        print(f" hougaard {rule} {side} {tf} {conf} {tp}", flush=True)
+                        oo = generate_hougaard(m1, rule, side, tf, conf, tp)
+                        if oo:
+                            pools[oo[0].variant] = oo
+                            print(f"  n={len(oo)}", flush=True)
+    return pools
+
+
+##### FILE: src/strategies/ict_bos_grab_choch.py #####
+"""ict_bos_grab_choch (fx_amirabbas, claims 80% WR):
+Prior BOS → wick-only liquidity grab (wick beyond swing, close back inside) → CHoCH of opposite swing
+with FVG on CHoCH leg → limit at FVG; SL beyond swept extreme; TP RR2 or swing. NY/all.
+"""
+from __future__ import annotations
+import numpy as np
+import pandas as pd
+from typing import Dict, List, Optional, Tuple
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from engine import Order
+from indicators import atr_prior, resample_ohlc, bar_end
+from strategies.common import dedupe_orders
+from strategies.ict_helpers import find_fvgs, swing_highs_lows, last_swing_before
+
+
+def generate_ict_bos_grab_choch(
+    m1: pd.DataFrame,
+    tf: str = "M5",
+    session: str = "ny",
+    tp_mode: str = "rr2",
+    entry_at: str = "mid",
+) -> List[Order]:
+    bar = 5 if tf == "M5" else 15
+    df = resample_ohlc(m1, f"{bar}min")
+    o, h, l, c = df["open"].values, df["high"].values, df["low"].values, df["close"].values
+    times = df.index
+    n = len(df)
+    a = atr_prior(df, 14).values
+    shi, sli = swing_highs_lows(h, l, 2, 2)
+    variant = f"bosgrab_{tf}_{session}_{tp_mode}_{entry_at}"
+    orders: List[Order] = []
+    used = set()
+
+    def in_sess(ts):
+        if session == "all":
+            return 7 <= ts.hour < 17
+        return 12 <= ts.hour < 17
+
+    # Precompute BOS bars
+    bos_up = np.zeros(n, dtype=bool)
+    bos_dn = np.zeros(n, dtype=bool)
+    for i in range(10, n):
+        sw = last_swing_before(shi, i)
+        if sw is not None and c[i] > h[sw] and c[i] > o[i]:
+            bos_up[i] = True
+        sw = last_swing_before(sli, i)
+        if sw is not None and c[i] < l[sw] and c[i] < o[i]:
+            bos_dn[i] = True
+
+    for i in range(40, n - 1):
+        ts = times[i]
+        if int(getattr(ts, "day_of_week", ts.dayofweek)) >= 5:
+            continue
+        if not in_sess(ts):
+            continue
+        atr_v = a[i]
+        if np.isnan(atr_v) or atr_v <= 0:
+            continue
+        day = ts.normalize()
+
+        # SHORT: recent bos_up, then wick grab above swing high, then choch below swing low
+        if (day, "short") not in used:
+            if bos_up[max(0, i - 50):i - 3].any():
+                # find wick grab in [i-20, i]
+                grab_j = None
+                grab_ext = None
+                for j in range(max(i - 20, 5), i + 1):
+                    sw_h = last_swing_before(shi, j)
+                    if sw_h is None:
+                        continue
+                    if h[j] > h[sw_h] and c[j] < h[sw_h]:  # wick-only
+                        grab_j = j
+                        grab_ext = float(h[j])
+                if grab_j is not None and grab_j <= i:
+                    # CHoCH at i: break last swing low that existed before/at grab
+                    sw_l = last_swing_before(sli, grab_j)
+                    if sw_l is not None and c[i] < l[sw_l] and i >= grab_j:
+                        # require some bearish close structure
+                        if c[i] < o[i] or c[i] < c[max(grab_j, i - 1)]:
+                            fvgs = find_fvgs(h, l, a, grab_j, i, "bear", 0.04)
+                            if fvgs:
+                                glo, ghi, _ = fvgs[-1]
+                                px = 0.5 * (glo + ghi) if entry_at == "mid" else float(glo)
+                                sl = grab_ext + max(0.1 * atr_v, 0.12)
+                                if sl > px:
+                                    risk = sl - px
+                                    if risk >= 0.2:
+                                        tp = (px - 2 * risk) if tp_mode == "rr2" else float(l[sw_l])
+                                        if tp_mode != "rr2" and tp >= px - 1.2 * risk:
+                                            tp = px - 2 * risk
+                                        arm = bar_end(times[i], bar)
+                                        orders.append(Order(
+                                            arm_time=arm, side="short", kind="limit", price=float(px),
+                                            sl=float(sl), tp=float(tp), strategy="BOSGrabCHoCH",
+                                            variant=variant, meta={"wick_only": True, "grab": grab_ext},
+                                            expire_minutes=90, max_hold_minutes=240,
+                                        ))
+                                        used.add((day, "short"))
+
+        if (day, "long") not in used:
+            if bos_dn[max(0, i - 50):i - 3].any():
+                grab_j = grab_ext = None
+                for j in range(max(i - 20, 5), i + 1):
+                    sw_l = last_swing_before(sli, j)
+                    if sw_l is None:
+                        continue
+                    if l[j] < l[sw_l] and c[j] > l[sw_l]:
+                        grab_j = j
+                        grab_ext = float(l[j])
+                if grab_j is not None:
+                    sw_h = last_swing_before(shi, grab_j)
+                    if sw_h is not None and c[i] > h[sw_h] and i >= grab_j:
+                        if c[i] > o[i] or c[i] > c[max(grab_j, i - 1)]:
+                            fvgs = find_fvgs(h, l, a, grab_j, i, "bull", 0.04)
+                            if fvgs:
+                                glo, ghi, _ = fvgs[-1]
+                                px = 0.5 * (glo + ghi) if entry_at == "mid" else float(ghi)
+                                sl = grab_ext - max(0.1 * atr_v, 0.12)
+                                if sl < px:
+                                    risk = px - sl
+                                    if risk >= 0.2:
+                                        tp = (px + 2 * risk) if tp_mode == "rr2" else float(h[sw_h])
+                                        if tp_mode != "rr2" and tp <= px + 1.2 * risk:
+                                            tp = px + 2 * risk
+                                        arm = bar_end(times[i], bar)
+                                        orders.append(Order(
+                                            arm_time=arm, side="long", kind="limit", price=float(px),
+                                            sl=float(sl), tp=float(tp), strategy="BOSGrabCHoCH",
+                                            variant=variant, meta={"wick_only": True, "grab": grab_ext},
+                                            expire_minutes=90, max_hold_minutes=240,
+                                        ))
+                                        used.add((day, "long"))
+
+    return dedupe_orders(orders, 40)
+
+
+def generate_bosgrab_family(m1: pd.DataFrame) -> Dict[str, List[Order]]:
+    pools = {}
+    for tf in ("M5", "M15"):
+        for sess in ("ny", "all"):
+            for tp in ("rr2", "swing"):
+                for ent in ("mid", "edge"):
+                    print(f" bosgrab {tf} {sess} {tp} {ent}", flush=True)
+                    oo = generate_ict_bos_grab_choch(m1, tf, sess, tp, ent)
+                    if oo:
+                        pools[oo[0].variant] = oo
+                        print(f"  n={len(oo)}", flush=True)
+                    else:
+                        print("  n=0", flush=True)
+    return pools
+
+
+##### FILE: src/strategies/ict_helpers.py #####
+"""Shared ICT building blocks — closed-bar only (M5)."""
+from __future__ import annotations
+import numpy as np
+import pandas as pd
+from typing import List, Optional, Tuple
+
+
+def find_fvgs(high, low, atr_arr, i_start: int, i_end: int, direction: str, min_atr=0.05):
+    """3-candle FVG. form_i = k+2. bull: low[k+2]>high[k]; bear: high[k+2]<low[k]."""
+    out = []
+    for k in range(max(i_start, 0), max(i_end - 1, 0)):
+        if k + 2 > i_end:
+            break
+        a = atr_arr[k + 2]
+        if np.isnan(a) or a <= 0:
+            continue
+        if direction == "bull":
+            gap = low[k + 2] - high[k]
+            if gap >= min_atr * a:
+                out.append((float(high[k]), float(low[k + 2]), k + 2))
+        else:
+            gap = low[k] - high[k + 2]
+            if gap >= min_atr * a:
+                out.append((float(high[k + 2]), float(low[k]), k + 2))
+    return out
+
+
+def swing_highs_lows(high, low, left: int = 2, right: int = 2):
+    """Confirmed pivots: returns (shi_list, sli_list) of indices."""
+    n = len(high)
+    shi, sli = [], []
+    for i in range(left, n - right):
+        h = high[i]
+        if all(h >= high[i - j] for j in range(1, left + 1)) and all(h > high[i + j] for j in range(1, right + 1)):
+            shi.append(i)
+        l = low[i]
+        if all(l <= low[i - j] for j in range(1, left + 1)) and all(l < low[i + j] for j in range(1, right + 1)):
+            sli.append(i)
+    return shi, sli
+
+
+def last_swing_before(swings: List[int], i: int) -> Optional[int]:
+    for s in reversed(swings):
+        if s < i:
+            return s
+    return None
+
+
+def is_displacement(open_, close, atr_v, mult: float = 1.0) -> bool:
+    if atr_v is None or np.isnan(atr_v) or atr_v <= 0:
+        return False
+    return abs(close - open_) >= mult * atr_v
+
+
+def asian_ranges(m1: pd.DataFrame) -> dict:
+    ranges = {}
+    for d in m1.index.normalize().unique():
+        if int(getattr(d, "day_of_week", d.dayofweek)) >= 5:
+            continue
+        seg = m1[(m1.index >= d) & (m1.index < d + pd.Timedelta(hours=7))]
+        if len(seg) < 30:
+            continue
+        ranges[pd.Timestamp(d)] = (float(seg["high"].max()), float(seg["low"].min()),
+                                   d + pd.Timedelta(hours=7))
+    return ranges
+
+
+def prev_day_hl(m1: pd.DataFrame) -> dict:
+    """UTC calendar day high/low keyed by next day (level available at next day open)."""
+    out = {}
+    for d in m1.index.normalize().unique():
+        seg = m1[(m1.index >= d) & (m1.index < d + pd.Timedelta(days=1))]
+        if len(seg) < 60:
+            continue
+        out[pd.Timestamp(d) + pd.Timedelta(days=1)] = (float(seg["high"].max()), float(seg["low"].min()))
+    return out
+
+
+def ny_hour(ts: pd.Timestamp) -> int:
+    """Hour in America/New_York."""
+    return int(ts.tz_convert("America/New_York").hour)
+
+
+def in_silver_bullet(ts: pd.Timestamp) -> bool:
+    """NY 10:00–11:00 America/New_York (inclusive start, exclusive end of hour window on bar open)."""
+    t = ts.tz_convert("America/New_York")
+    return t.hour == 10
+
+
+def opposing_liquidity(side: str, asian_h: float, asian_l: float, prev_h: float, prev_l: float,
+                       entry: float) -> float:
+    """TP toward opposing session liquidity."""
+    if side == "long":
+        cands = [x for x in (asian_h, prev_h) if x > entry + 0.2]
+        return max(cands) if cands else entry + abs(entry) * 0  # fallback handled by caller
+    cands = [x for x in (asian_l, prev_l) if x < entry - 0.2]
+    return min(cands) if cands else entry
+
+
+##### FILE: src/strategies/idris.py #####
+"""Idris: H4 high/low (closed) + M1 RSI hidden div + Inside Bar → market after IB close."""
+from __future__ import annotations
+import numpy as np
+import pandas as pd
+from typing import List
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from engine import Order
+from indicators import rsi, inside_bar, resample_ohlc, atr_prior, bar_end, in_session, vol_ma
+from strategies.common import apply_dxy_gate, apply_vol_gate, dedupe_orders
+
+
+def generate_idris(m1, dxy=None, use_dxy=False, use_vol=False, rr=3.0, vol_mult=1.3) -> List[Order]:
+    h4 = resample_ohlc(m1, "4h")
+    m1_rsi = rsi(m1["close"], 14).values
+    ib = inside_bar(m1).values
+    a = atr_prior(m1, 14).values
+    high, low, close = m1["high"].values, m1["low"].values, m1["close"].values
+    times = m1.index
+    h4_high, h4_low, h4_idx = h4["high"].values, h4["low"].values, h4.index
+    # simple pivot lows/highs left=3 right=3 — only use pivots confirmed (i-3)
+    n = len(m1)
+    pl = np.zeros(n, dtype=bool)
+    ph = np.zeros(n, dtype=bool)
+    for i in range(3, n - 3):
+        if low[i] == low[i-3:i+4].min() and (low[i-3:i+4] == low[i]).sum() == 1:
+            pl[i + 3] = True  # confirm at i+3 → store flag at confirm bar pointing... simplify: mark pivot bar when confirmed
+        if high[i] == high[i-3:i+4].max() and (high[i-3:i+4] == high[i]).sum() == 1:
+            ph[i + 3] = True
+    # Better: store confirmed pivot indices
+    pivot_lows, pivot_highs = [], []
+    for i in range(3, n - 3):
+        if low[i] == low[i-3:i+4].min() and (low[i-3:i+4] == low[i]).sum() == 1:
+            pivot_lows.append(i)  # known only after i+3
+        if high[i] == high[i-3:i+4].max() and (high[i-3:i+4] == high[i]).sum() == 1:
+            pivot_highs.append(i)
+
+    orders = []
+    vol_ma20 = vol_ma(m1["volume"], 20) if "volume" in m1.columns else None
+    pl_arr = np.array(pivot_lows) if pivot_lows else np.array([], dtype=int)
+    ph_arr = np.array(pivot_highs) if pivot_highs else np.array([], dtype=int)
+
+    for i in range(50, n - 1):
+        ts = times[i]
+        if not in_session(ts) or not ib[i]:
+            continue
+        atr_i = a[i]
+        if np.isnan(atr_i) or atr_i <= 0:
+            continue
+        # last CLOSED H4: bar ending <= ts
+        # H4 left-labeled; closed when start+4h <= ts → start <= ts-4h
+        deadline = ts - pd.Timedelta(hours=4)
+        hi = h4_idx.searchsorted(deadline, side="right") - 1
+        if hi < 0:
+            continue
+        zh, zl = float(h4_high[hi]), float(h4_low[hi])
+        tol = 0.15 * atr_i
+        touched_low = low[max(0, i-5):i+1].min() <= zl + tol
+        touched_high = high[max(0, i-5):i+1].max() >= zh - tol
+
+        # pivots confirmed only if pivot_bar + 3 <= i
+        side = None
+        if touched_low:
+            pls = pl_arr[pl_arr + 3 <= i]
+            if len(pls) >= 2:
+                p2, p1 = pls[-1], pls[-2]
+                if low[p2] > low[p1] and m1_rsi[p2] < m1_rsi[p1]:
+                    side = "long"
+        if side is None and touched_high:
+            phs = ph_arr[ph_arr + 3 <= i]
+            if len(phs) >= 2:
+                p2, p1 = phs[-1], phs[-2]
+                if high[p2] < high[p1] and m1_rsi[p2] > m1_rsi[p1]:
+                    side = "short"
+        if side is None:
+            continue
+
+        if side == "long":
+            entry = float(high[i])  # buy stop ref at IB high — use market after close at close
+            entry = float(close[i])
+            sl = float(low[i]) - 0.05 * atr_i
+            risk = entry - sl
+            if risk <= 0.05:
+                continue
+            tp = entry + rr * risk
+        else:
+            entry = float(close[i])
+            sl = float(high[i]) + 0.05 * atr_i
+            risk = sl - entry
+            if risk <= 0.05:
+                continue
+            tp = entry - rr * risk
+
+        arm = bar_end(ts, 1)
+        orders.append(Order(arm, side, "market", entry, sl, tp, "Idris", f"h4_rsi_ib_rr{rr}",
+                            {"signal_bar": ts}, 30))
+
+    orders = dedupe_orders(orders, 30)
+    if use_vol and vol_ma20 is not None:
+        orders = apply_vol_gate(orders, m1["volume"], vol_ma20, True, vol_mult, 1)
+    return apply_dxy_gate(orders, dxy, use_dxy)
+
+
+##### FILE: src/strategies/idris_v2.py #####
+"""Idris v2 (author reel): H4 level → reaction → hidden div on exec TF → IB entry.
+
+Closed bars only. Use generate_idris_v2_grid() for multi entry/sl/tp in one scan.
+"""
+from __future__ import annotations
+import numpy as np
+import pandas as pd
+from typing import Dict, List, Optional, Tuple
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from engine import Order
+from indicators import (
+    atr_prior, resample_ohlc, bar_end, inside_bar, rsi, macd, stoch,
+    in_tokyo_london,
+)
+from strategies.common import dedupe_orders
+from strategies.ict_helpers import swing_highs_lows, last_swing_before
+
+
+def _osc_series(df: pd.DataFrame, osc: str) -> np.ndarray:
+    if osc == "rsi14":
+        return rsi(df["close"], 14).values
+    if osc == "macd":
+        _, _, hist = macd(df["close"], 12, 26, 9)
+        return hist.values
+    if osc == "stoch":
+        k, _ = stoch(df["high"], df["low"], df["close"], 14, 3, 3)
+        return k.values
+    raise ValueError(osc)
+
+
+def _confirmed_pivots(high, low, left=3, right=3):
+    n = len(high)
+    pls, phs = [], []
+    for i in range(left, n - right):
+        w = low[i - left:i + right + 1]
+        if low[i] == w.min() and (w == low[i]).sum() == 1:
+            pls.append(i)
+        w = high[i - left:i + right + 1]
+        if high[i] == w.max() and (w == high[i]).sum() == 1:
+            phs.append(i)
+    return np.array(pls, dtype=int), np.array(phs, dtype=int)
+
+
+def _h4_levels(h4: pd.DataFrame, mode: str):
+    h, l = h4["high"].values, h4["low"].values
+    n = len(h4)
+    if mode == "h4_hl":
+        return h.copy(), l.copy(), h4.index
+    shi, sli = swing_highs_lows(h, l, 2, 2)
+    zh = np.full(n, np.nan)
+    zl = np.full(n, np.nan)
+    last_sh = last_sl = np.nan
+    si = sj = 0
+    for i in range(n):
+        while si < len(shi) and shi[si] + 2 <= i:
+            last_sh = float(h[shi[si]]); si += 1
+        while sj < len(sli) and sli[sj] + 2 <= i:
+            last_sl = float(l[sli[sj]]); sj += 1
+        zh[i] = last_sh
+        zl[i] = last_sl
+    return zh, zl, h4.index
+
+
+def generate_idris_v2_grid(
+    m1: pd.DataFrame,
+    level: str = "h4_hl",
+    osc: str = "rsi14",
+    entry_tf: str = "M5",
+    session: str = "tokyo_london",
+    entries: Tuple[str, ...] = ("stop", "close"),
+    sls: Tuple[str, ...] = ("mother", "swing"),
+    tps: Tuple[str, ...] = ("rr3", "rr3_trail"),
+    rr: float = 3.0,
+    atr_buf: float = 0.05,
+    pivot_lr: int = 3,
+) -> Dict[str, List[Order]]:
+    """One scan → many order-style variants."""
+    bar_m = {"M1": 1, "M5": 5, "M15": 15}[entry_tf]
+    rule = {1: "1min", 5: "5min", 15: "15min"}[bar_m]
+    df = m1 if entry_tf == "M1" else resample_ohlc(m1, rule)
+    h4 = resample_ohlc(m1, "4h")
+
+    h = df["high"].values
+    l = df["low"].values
+    c = df["close"].values
+    times = df.index
+    n = len(df)
+    a = atr_prior(df, 14).values
+    ib = inside_bar(df).values
+    osc_v = _osc_series(df, osc)
+    pl_arr, ph_arr = _confirmed_pivots(h, l, pivot_lr, pivot_lr)
+    shi, sli = swing_highs_lows(h, l, 2, 2)
+    zh_all, zl_all, h4_idx = _h4_levels(h4, level)
+
+    pools: Dict[str, List[Order]] = {}
+    for em in entries:
+        for sm in sls:
+            for tm in tps:
+                pools[f"idris_{level}_{osc}_{entry_tf}_{em}_{sm}_{tm}_{session}"] = []
+
+    for i in range(60, n - 1):
+        ts = times[i]
+        if int(getattr(ts, "day_of_week", ts.dayofweek)) >= 5:
+            continue
+        if session == "tokyo_london" and not in_tokyo_london(ts):
+            continue
+        if not ib[i]:
+            continue
+        atr_i = a[i]
+        if np.isnan(atr_i) or atr_i <= 0 or np.isnan(osc_v[i]):
+            continue
+
+        deadline = ts - pd.Timedelta(hours=4)
+        hi = h4_idx.searchsorted(deadline, side="right") - 1
+        if hi < 0:
+            continue
+        zh, zl = float(zh_all[hi]), float(zl_all[hi])
+        if np.isnan(zh) or np.isnan(zl):
+            continue
+
+        tol = 0.15 * atr_i
+        look = max(0, i - 8)
+        touched_low = float(np.min(l[look:i + 1])) <= zl + tol
+        touched_high = float(np.max(h[look:i + 1])) >= zh - tol
+
+        side = None
+        if touched_low:
+            pls = pl_arr[pl_arr + pivot_lr <= i]
+            if len(pls) >= 2:
+                p2, p1 = int(pls[-1]), int(pls[-2])
+                if l[p2] > l[p1] and osc_v[p2] < osc_v[p1]:
+                    side = "long"
+        if side is None and touched_high:
+            phs = ph_arr[ph_arr + pivot_lr <= i]
+            if len(phs) >= 2:
+                p2, p1 = int(phs[-1]), int(phs[-2])
+                if h[p2] < h[p1] and osc_v[p2] > osc_v[p1]:
+                    side = "short"
+        if side is None:
+            continue
+
+        m_hi, m_lo = float(h[i - 1]), float(l[i - 1])
+        buf = max(atr_buf * atr_i, 0.10)
+        arm = bar_end(ts, bar_m)
+
+        # precompute swing SL
+        sw_sl = None
+        if side == "long":
+            sw = last_swing_before(sli, i)
+            if sw is not None:
+                sw_sl = min(float(l[sw]), m_lo) - buf
+        else:
+            sw = last_swing_before(shi, i)
+            if sw is not None:
+                sw_sl = max(float(h[sw]), m_hi) + buf
+        mother_sl = (m_lo - buf) if side == "long" else (m_hi + buf)
+
+        for em in entries:
+            kind = "stop" if em == "stop" else "market"
+            px = (m_hi if side == "long" else m_lo) if em == "stop" else float(c[i])
+            for sm in sls:
+                sl = mother_sl if sm == "mother" else sw_sl
+                if sl is None:
+                    continue
+                risk = abs(px - sl)
+                if risk < 0.20:
+                    continue
+                if (side == "long" and sl >= px) or (side == "short" and sl <= px):
+                    continue
+                for tm in tps:
+                    tp = px + rr * risk if side == "long" else px - rr * risk
+                    meta = {"signal_bar": ts, "h4": (zh, zl)}
+                    if tm == "rr3_trail":
+                        meta["trail_activate_r"] = 1.5
+                    v = f"idris_{level}_{osc}_{entry_tf}_{em}_{sm}_{tm}_{session}"
+                    pools[v].append(Order(
+                        arm_time=arm, side=side, kind=kind, price=float(px),
+                        sl=float(sl), tp=float(tp),
+                        strategy="IdrisV2", variant=v, meta=meta,
+                        expire_minutes=60 if kind == "stop" else 20,
+                        max_hold_minutes=480,
+                    ))
+
+    return {k: dedupe_orders(v, 40) for k, v in pools.items() if v}
+
+
+def generate_idris_v2(m1, **kwargs) -> List[Order]:
+    """Single-variant wrapper."""
+    level = kwargs.pop("level", "h4_hl")
+    osc = kwargs.pop("osc", "rsi14")
+    entry_tf = kwargs.pop("entry_tf", "M5")
+    session = kwargs.pop("session", "tokyo_london")
+    entry_mode = kwargs.pop("entry_mode", "stop")
+    sl_mode = kwargs.pop("sl_mode", "mother")
+    tp_mode = kwargs.pop("tp_mode", "rr3")
+    kwargs.pop("dxy", None)
+    kwargs.pop("use_dxy", None)
+    grid = generate_idris_v2_grid(
+        m1, level=level, osc=osc, entry_tf=entry_tf, session=session,
+        entries=(entry_mode,), sls=(sl_mode,), tps=(tp_mode,),
+        **{k: kwargs[k] for k in ("rr", "atr_buf", "pivot_lr") if k in kwargs},
+    )
+    v = f"idris_{level}_{osc}_{entry_tf}_{entry_mode}_{sl_mode}_{tp_mode}_{session}"
+    return grid.get(v, [])
+
+
+##### FILE: src/strategies/liq_sweep_mss.py #####
+"""London/NY liquidity sweep of Asian or previous-day HL → displacement → MSS → FVG entry."""
+from __future__ import annotations
+import numpy as np
+import pandas as pd
+from typing import List, Dict
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from engine import Order
+from indicators import atr_prior, resample_ohlc, bar_end
+from strategies.common import apply_dxy_gate, dedupe_orders
+from strategies.ict_helpers import (
+    find_fvgs, swing_highs_lows, last_swing_before, is_displacement,
+    asian_ranges, prev_day_hl, opposing_liquidity,
+)
+
+
+def generate_liq_sweep_mss(
+    m1: pd.DataFrame,
+    dxy=None,
+    use_dxy: bool = False,
+    level: str = "asian",          # asian | prev_day | both
+    session: str = "both",         # london | ny | both
+    entry_mode: str = "limit_mid", # limit_mid | market
+    tp_mode: str = "rr2",          # rr1.5 | rr2 | liq
+    disp_atr: float = 1.0,
+    sl_mode: str = "atr_buf",        # atr_buf | sweep
+) -> List[Order]:
+    m5 = resample_ohlc(m1, "5min")
+    a = atr_prior(m5, 14).values
+    o, h, l, c = m5["open"].values, m5["high"].values, m5["low"].values, m5["close"].values
+    times = m5.index
+    n = len(m5)
+    shi, sli = swing_highs_lows(h, l, 2, 2)
+    asian = asian_ranges(m1)
+    pdhl = prev_day_hl(m1)
+    variant = f"ls_{level}_{session}_{entry_mode}_{tp_mode}_d{disp_atr}_sl{sl_mode}"
+    orders: List[Order] = []
+    used = set()  # (day, side)
+
+    def in_sess(ts):
+        hr = ts.hour  # UTC
+        if session == "london":
+            return 7 <= hr < 12
+        if session == "ny":
+            return 12 <= hr < 17
+        return (7 <= hr < 12) or (12 <= hr < 17)
+
+    for i in range(10, n - 1):
+        ts = times[i]
+        if int(getattr(ts, "day_of_week", ts.dayofweek)) >= 5:
+            continue
+        if not in_sess(ts):
+            continue
+        day = ts.normalize()
+        atr_v = a[i]
+        if np.isnan(atr_v) or atr_v <= 0:
+            continue
+
+        levels_hi, levels_lo = [], []
+        if level in ("asian", "both"):
+            for k, (ah, al, _) in asian.items():
+                if k.date() == day.date():
+                    levels_hi.append(ah); levels_lo.append(al)
+        if level in ("prev_day", "both"):
+            if day in pdhl:
+                levels_hi.append(pdhl[day][0]); levels_lo.append(pdhl[day][1])
+        if not levels_hi or not levels_lo:
+            continue
+        liq_hi, liq_lo = max(levels_hi), min(levels_lo)
+
+        # Detect sweep on this bar or recent 3 bars in session
+        swept_hi = swept_lo = False
+        ext_hi = ext_lo = None
+        for j in range(max(i - 3, 0), i + 1):
+            if not in_sess(times[j]):
+                continue
+            if h[j] > liq_hi:
+                swept_hi = True
+                ext_hi = h[j] if ext_hi is None else max(ext_hi, h[j])
+            if l[j] < liq_lo:
+                swept_lo = True
+                ext_lo = l[j] if ext_lo is None else min(ext_lo, l[j])
+
+        setups = []
+        # MSS + displacement on bar i after sweep
+        if swept_hi and (day, "short") not in used:
+            sw = last_swing_before(sli, i)
+            if sw is not None and c[i] < l[sw] and is_displacement(o[i], c[i], atr_v, disp_atr) and c[i] < o[i]:
+                setups.append(("short", ext_hi, "bear"))
+        if swept_lo and (day, "long") not in used:
+            sw = last_swing_before(shi, i)
+            if sw is not None and c[i] > h[sw] and is_displacement(o[i], c[i], atr_v, disp_atr) and c[i] > o[i]:
+                setups.append(("long", ext_lo, "bull"))
+
+        for side, sweep_ext, fvg_dir in setups:
+            fvgs = find_fvgs(h, l, a, max(i - 6, 0), i, fvg_dir, min_atr=0.08)
+            if not fvgs:
+                continue
+            gap_lo, gap_hi, form_i = fvgs[-1]
+            mid = 0.5 * (gap_lo + gap_hi)
+            if entry_mode == "limit_mid":
+                kind, px = "limit", mid
+            else:
+                kind, px = "market", float(c[i])
+            buf = max(0.25 * atr_v, 0.15)
+            if sl_mode == "atr_buf":
+                sl = (gap_hi + buf) if side == "short" else (gap_lo - buf)
+            else:
+                sl = sweep_ext + (0.05 if side == "short" else -0.05)
+            risk = abs(px - sl)
+            if risk < 0.15:
+                continue
+            if (side == "long" and sl >= px) or (side == "short" and sl <= px):
+                continue
+            if tp_mode.startswith("rr"):
+                rr = float(tp_mode.replace("rr", ""))
+                tp = px + rr * risk if side == "long" else px - rr * risk
+            else:
+                tp = opposing_liquidity(side, liq_hi, liq_lo, liq_hi, liq_lo, px)
+                if side == "long" and tp <= px + 0.9 * risk:
+                    tp = px + 2 * risk
+                if side == "short" and tp >= px - 0.9 * risk:
+                    tp = px - 2 * risk
+
+            arm = bar_end(times[i], 5)
+            orders.append(Order(
+                arm_time=arm, side=side, kind=kind, price=px, sl=sl, tp=tp,
+                strategy="LiqSweepMSS", variant=variant,
+                meta={"signal_bar": times[i], "day": str(day.date()), "level": level},
+                expire_minutes=60 if kind == "limit" else 20,
+                max_hold_minutes=240,
+            ))
+            used.add((day, side))
+
+    orders = dedupe_orders(orders, 40)
+    return apply_dxy_gate(orders, dxy, use_dxy)
+
+
+def generate_liq_sweep_ifvg(
+    m1: pd.DataFrame,
+    dxy=None,
+    use_dxy: bool = False,
+    level: str = "asian",
+    session: str = "ny",
+    tp_mode: str = "rr2",          # rr2 | swing
+    disp_atr: float = 1.0,
+    atr_buf: float = 0.15,
+) -> List[Order]:
+    """iFVG entry on LiqSweep+MSS path (trendline-break skipped — subjective).
+
+    After sweep: look for an *opposite-direction* FVG that later gets closed through by a body
+    (inversion); enter limit on retest of that inverted FVG; SL beyond sweep extreme; TP prior
+    opposite swing or RR2.
+    """
+    from typing import Dict
+    m5 = resample_ohlc(m1, "5min")
+    a = atr_prior(m5, 14).values
+    o, h, l, c = m5["open"].values, m5["high"].values, m5["low"].values, m5["close"].values
+    times = m5.index
+    n = len(m5)
+    shi, sli = swing_highs_lows(h, l, 2, 2)
+    asian = asian_ranges(m1)
+    pdhl = prev_day_hl(m1)
+    variant = f"ls_ifvg_{level}_{session}_{tp_mode}_d{disp_atr}"
+    orders: List[Order] = []
+    used = set()
+
+    def in_sess(ts):
+        hr = ts.hour
+        if session == "london":
+            return 7 <= hr < 12
+        if session == "ny":
+            return 12 <= hr < 17
+        return (7 <= hr < 12) or (12 <= hr < 17)
+
+    for i in range(15, n - 1):
+        ts = times[i]
+        if int(getattr(ts, "day_of_week", ts.dayofweek)) >= 5:
+            continue
+        if not in_sess(ts):
+            continue
+        day = ts.normalize()
+        atr_v = a[i]
+        if np.isnan(atr_v) or atr_v <= 0:
+            continue
+
+        levels_hi, levels_lo = [], []
+        if level in ("asian", "both"):
+            for k, (ah, al, _) in asian.items():
+                if k.date() == day.date():
+                    levels_hi.append(ah); levels_lo.append(al)
+        if level in ("prev_day", "both"):
+            if day in pdhl:
+                levels_hi.append(pdhl[day][0]); levels_lo.append(pdhl[day][1])
+        if not levels_hi or not levels_lo:
+            continue
+        liq_hi, liq_lo = max(levels_hi), min(levels_lo)
+
+        # find recent sweep in last ~8 M5 bars
+        swept_hi = swept_lo = False
+        ext_hi = ext_lo = None
+        sweep_j = None
+        for j in range(max(i - 16, 0), i + 1):
+            if not in_sess(times[j]):
+                continue
+            if h[j] > liq_hi:
+                swept_hi = True
+                ext_hi = h[j] if ext_hi is None else max(ext_hi, h[j])
+                sweep_j = j if sweep_j is None else max(sweep_j, j)
+            if l[j] < liq_lo:
+                swept_lo = True
+                ext_lo = l[j] if ext_lo is None else min(ext_lo, l[j])
+                sweep_j = j if sweep_j is None else max(sweep_j, j)
+        if sweep_j is None:
+            continue
+
+        setups = []
+        # short: swept high → look for bullish FVG formed after sweep that then gets closed below (inversion to bear)
+        if swept_hi and (day, "short") not in used:
+            # opposite-dir FVG after sweep = bullish FVG (manipulation wick side)
+            opp = find_fvgs(h, l, a, sweep_j, i, "bull", min_atr=0.05)
+            for glo, ghi, fi in opp:
+                # inversion: body close through below gap_lo after formation
+                for k in range(fi + 1, i + 1):
+                    if c[k] < glo:
+                        setups.append(("short", ext_hi, glo, ghi, k))
+                        break
+        if swept_lo and (day, "long") not in used:
+            opp = find_fvgs(h, l, a, sweep_j, i, "bear", min_atr=0.05)
+            for glo, ghi, fi in opp:
+                for k in range(fi + 1, i + 1):
+                    if c[k] > ghi:
+                        setups.append(("long", ext_lo, glo, ghi, k))
+                        break
+
+        for side, sweep_ext, glo, ghi, inv_i in setups:
+            # arm on first retest bar at/after inversion (incl. inversion bar)
+            if i < inv_i or i - inv_i > 10:
+                continue
+            if not (l[i] <= ghi and h[i] >= glo):
+                continue
+            px = 0.5 * (glo + ghi)
+            buf = max(atr_buf * atr_v, 0.12)
+            if side == "short":
+                sl = sweep_ext + buf
+                if sl <= px:
+                    continue
+                risk = sl - px
+            else:
+                sl = sweep_ext - buf
+                if sl >= px:
+                    continue
+                risk = px - sl
+            if risk < 0.2:
+                continue
+            if tp_mode == "rr2":
+                tp = px - 2 * risk if side == "short" else px + 2 * risk
+            else:
+                # prior opposite swing
+                if side == "short":
+                    sw = last_swing_before(sli, i)
+                    tp = float(l[sw]) if sw is not None else px - 2 * risk
+                    if tp >= px - 1.2 * risk:
+                        tp = px - 2 * risk
+                else:
+                    sw = last_swing_before(shi, i)
+                    tp = float(h[sw]) if sw is not None else px + 2 * risk
+                    if tp <= px + 1.2 * risk:
+                        tp = px + 2 * risk
+            arm = bar_end(times[i], 5)
+            orders.append(Order(
+                arm_time=arm, side=side, kind="limit", price=float(px),
+                sl=float(sl), tp=float(tp),
+                strategy="LiqSweepIFVG", variant=variant,
+                meta={"note": "trendline-break skipped (subjective)", "inv_i": str(times[i])},
+                expire_minutes=90, max_hold_minutes=240,
+            ))
+            used.add((day, side))
+
+    return apply_dxy_gate(dedupe_orders(orders, 40), dxy, use_dxy)
+
+
+def generate_liq_ifvg_family(m1: pd.DataFrame) -> Dict[str, List[Order]]:
+    from typing import Dict as _D
+    pools: _D[str, List[Order]] = {}
+    for level in ("asian", "prev_day", "both"):
+        for sess in ("ny", "london", "both"):
+            for tp in ("rr2", "swing"):
+                print(f" ls_ifvg {level} {sess} {tp}", flush=True)
+                oo = generate_liq_sweep_ifvg(m1, level=level, session=sess, tp_mode=tp)
+                if oo:
+                    pools[oo[0].variant] = oo
+                    print(f"  n={len(oo)}", flush=True)
+    return pools
+
+
+##### FILE: src/strategies/magnet_pdmid.py #####
+"""Previous-day midpoint magnet: long above mid→PDH, short below→PDL. London/NY on M15 context."""
+from __future__ import annotations
+import numpy as np
+import pandas as pd
+from typing import Dict, List, Tuple
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from engine import Order
+from indicators import atr_prior, resample_ohlc, bar_end, bullish_engulfing, bearish_engulfing
+from strategies.common import dedupe_orders
+from strategies.ict_helpers import swing_highs_lows, last_swing_before, prev_day_hl
+
+
+def base_rate_stats(m1: pd.DataFrame) -> dict:
+    """Given price above/below mid in London/NY, how often PDH/PDL touched before opposite."""
+    pdhl = prev_day_hl(m1)
+    m15 = resample_ohlc(m1, "15min")
+    results = {"above_mid_pdh_first": 0, "above_mid_pdl_first": 0, "above_n": 0,
+               "below_mid_pdl_first": 0, "below_mid_pdh_first": 0, "below_n": 0,
+               "day_boundary": "UTC via prev_day_hl"}
+    # group m15 by day
+    for day, (pdh, pdl) in pdhl.items():
+        mid = 0.5 * (pdh + pdl)
+        # session bars 07-21 UTC
+        seg = m15[(m15.index >= day) & (m15.index < day + pd.Timedelta(days=1))]
+        seg = seg[(seg.index.hour >= 7) & (seg.index.hour < 21)]
+        if len(seg) < 5 or pdh - pdl < 1.0:
+            continue
+        # first classification when inside range
+        classified = None
+        for ts, r in seg.iterrows():
+            if not (pdl < r.close < pdh):
+                continue
+            if r.close > mid:
+                classified = "above"; results["above_n"] += 1
+            else:
+                classified = "below"; results["below_n"] += 1
+            # walk forward: which extreme first
+            fut = seg[seg.index >= ts]
+            hit = None
+            for _, rr in fut.iterrows():
+                if rr.high >= pdh and rr.low <= pdl:
+                    # same bar both — skip
+                    hit = "both"; break
+                if rr.high >= pdh:
+                    hit = "pdh"; break
+                if rr.low <= pdl:
+                    hit = "pdl"; break
+            if classified == "above":
+                if hit == "pdh": results["above_mid_pdh_first"] += 1
+                elif hit == "pdl": results["above_mid_pdl_first"] += 1
+            else:
+                if hit == "pdl": results["below_mid_pdl_first"] += 1
+                elif hit == "pdh": results["below_mid_pdh_first"] += 1
+            break  # one per day
+    for k in ("above", "below"):
+        n = results[f"{k}_n"]
+        if k == "above":
+            results["above_pdh_rate"] = results["above_mid_pdh_first"] / n if n else None
+        else:
+            results["below_pdl_rate"] = results["below_mid_pdl_first"] / n if n else None
+    return results
+
+
+def generate_magnet(
+    m1: pd.DataFrame,
+    entry_tf: str = "M5",       # M5 | M15
+    trigger: str = "engulf",    # engulf | sweep_mss | pullback_mid
+    min_rr: float = 1.5,
+    atr_buf: float = 0.1,
+) -> List[Order]:
+    pdhl = prev_day_hl(m1)
+    bar_m = 5 if entry_tf == "M5" else 15
+    df = resample_ohlc(m1, f"{bar_m}min")
+    o, h, l, c = df["open"].values, df["high"].values, df["low"].values, df["close"].values
+    times = df.index
+    n = len(df)
+    a = atr_prior(df, 14).values
+    shi, sli = swing_highs_lows(h, l, 2, 2)
+    bull_eng = bullish_engulfing(df).values
+    bear_eng = bearish_engulfing(df).values
+
+    variant = f"magnet_{entry_tf}_{trigger}_rr{min_rr}"
+    orders: List[Order] = []
+    used = set()
+
+    for i in range(20, n - 1):
+        ts = times[i]
+        if int(getattr(ts, "day_of_week", ts.dayofweek)) >= 5:
+            continue
+        hr = ts.hour
+        if not (7 <= hr < 21):
+            continue
+        day = ts.normalize()
+        box = pdhl.get(day)
+        if box is None:
+            continue
+        pdh, pdl = box
+        if pdh - pdl < 1.0:
+            continue
+        mid = 0.5 * (pdh + pdl)
+        # must be inside range
+        if not (pdl < c[i] < pdh):
+            continue
+        atr_v = a[i]
+        if np.isnan(atr_v) or atr_v <= 0:
+            continue
+        key = (day.date(),)
+        if key in used:
+            continue
+
+        side = None
+        if c[i] > mid:
+            side = "long"; tp = pdh
+        else:
+            side = "short"; tp = pdl
+
+        # triggers
+        ok = False
+        if trigger == "engulf":
+            ok = (side == "long" and bull_eng[i]) or (side == "short" and bear_eng[i])
+        elif trigger == "sweep_mss":
+            if side == "long":
+                sw = last_swing_before(sli, i)
+                ok = sw is not None and l[i] < l[sw] and c[i] > o[i] and c[i] > l[sw]
+            else:
+                sw = last_swing_before(shi, i)
+                ok = sw is not None and h[i] > h[sw] and c[i] < o[i] and c[i] < h[sw]
+        elif trigger == "pullback_mid":
+            # touch mid then close back on bias side
+            touched = l[i] <= mid <= h[i]
+            if side == "long":
+                ok = touched and c[i] > mid and c[i] > o[i]
+            else:
+                ok = touched and c[i] < mid and c[i] < o[i]
+        if not ok:
+            continue
+
+        px = float(c[i])
+        buf = max(atr_buf * atr_v, 0.12)
+        if side == "long":
+            sw = last_swing_before(sli, i)
+            sl = (float(l[sw]) - buf) if sw is not None else float(l[i]) - buf
+            if sl >= px:
+                continue
+        else:
+            sw = last_swing_before(shi, i)
+            sl = (float(h[sw]) + buf) if sw is not None else float(h[i]) + buf
+            if sl <= px:
+                continue
+        risk = abs(px - sl)
+        if risk < 0.20:
+            continue
+        rr = abs(tp - px) / risk
+        if rr < min_rr:
+            continue
+
+        arm = bar_end(ts, bar_m)
+        orders.append(Order(
+            arm_time=arm, side=side, kind="market", price=px, sl=float(sl), tp=float(tp),
+            strategy="MagnetPDMid", variant=variant,
+            meta={"pdh": pdh, "pdl": pdl, "mid": mid},
+            expire_minutes=20, max_hold_minutes=360,
+        ))
+        used.add(key)
+
+    return dedupe_orders(orders, 40)
+
+
+def generate_magnet_family(m1: pd.DataFrame) -> Dict[str, List[Order]]:
+    pools = {}
+    for tf in ("M5", "M15"):
+        for trig in ("engulf", "sweep_mss", "pullback_mid"):
+            for rr in (1.5, 2.0):
+                print(f" magnet {tf} {trig} rr{rr}", flush=True)
+                oo = generate_magnet(m1, tf, trig, rr)
+                if oo:
+                    pools[oo[0].variant] = oo
+                    print(f"  n={len(oo)}", flush=True)
+    return pools
+
+
+##### FILE: src/strategies/micromap.py #####
+"""MicroMAP M5 — single entry H1/IB/H2, no re-entries."""
+from __future__ import annotations
+import numpy as np
+import pandas as pd
+from typing import List
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from engine import Order
+from indicators import atr_prior, body, is_bull, is_bear, inside_bar, resample_ohlc, bar_end, in_session, vol_ma
+from strategies.common import apply_dxy_gate, apply_vol_gate, dedupe_orders
+
+
+def generate_micromap(m1, dxy=None, use_dxy=False, use_vol=False, vol_mult=1.3, rule: str = "5min",
+                      allow_reentry: bool = False) -> List[Order]:
+    """allow_reentry: if True, emit H1 then H2-style next attempts (teacher chain); prop usually False."""
+    df = resample_ohlc(m1, rule)
+    a = atr_prior(df, 14).values
+    bodies = body(df).values
+    bull, bear = is_bull(df).values, is_bear(df).values
+    high, low, close = df["high"].values, df["low"].values, df["close"].values
+    times = df.index
+    ib = inside_bar(df).values
+    volma = vol_ma(df["volume"], 20) if "volume" in df.columns else None
+    bar_min = {"1min":1,"5min":5,"15min":15,"30min":30,"1h":60,"4h":240}.get(rule, 5)
+    n = len(df)
+    orders = []
+
+    for i in range(20, n - 15):
+        atr_i = a[i]
+        if np.isnan(atr_i) or atr_i <= 0:
+            continue
+        for slen in (2, 3, 4):
+            s0 = i - slen + 1
+            if s0 < 0: continue
+            # bullish spike
+            if all(bull[s0:i+1]) and all(bodies[s0:i+1] > 1.0*atr_i):
+                if any((high[k]-close[k]) > 0.35*bodies[k] for k in range(s0,i+1) if bodies[k]>0):
+                    continue
+                spike_high = float(high[s0:i+1].max()); spike_low = float(low[s0])
+                for end in range(i+3, min(i+10, n-3)):
+                    seg_h, seg_l, seg_b = high[i+1:end+1], low[i+1:end+1], bodies[i+1:end+1]
+                    if not all(seg_h[k] <= seg_h[k-1]+0.05*atr_i for k in range(1,len(seg_h))):
+                        continue
+                    if float(np.mean(seg_b)) > 0.7*float(np.mean(bodies[s0:i+1])):
+                        continue
+                    if seg_l.min() < spike_low - 0.1*atr_i:
+                        continue
+                    ch_high, ch_low = float(seg_h[-1]), float(seg_l.min())
+                    # H1: after channel ends, arm buy stop at ch_high
+                    if in_session(times[end]):
+                        arm = bar_end(times[end], bar_min)
+                        entry, sl = ch_high, ch_low - 0.05*atr_i
+                        risk = entry - sl
+                        if 0.05 < risk <= 2.5*atr_i:
+                            orders.append(Order(arm,"long","stop",entry,sl,entry+1.5*risk,"MicroMAP",f"{rule}_H1_rr1.5",{"signal_bar":times[end]},60))
+                    if end+1 < n and ib[end+1] and in_session(times[end+1]):
+                        arm = bar_end(times[end+1], bar_min)
+                        entry, sl = float(high[end+1]), float(low[end+1])-0.05*atr_i
+                        risk = entry - sl
+                        if 0.05 < risk <= 2.5*atr_i:
+                            orders.append(Order(arm,"long","stop",entry,sl,entry+1.5*risk,"MicroMAP",f"{rule}_IB_rr1.5",{"signal_bar":times[end+1]},60))
+                    if end+2 < n and high[end+1] > ch_high and high[end+2] > high[end+1] and in_session(times[end+2]):
+                        arm = bar_end(times[end+2], bar_min)
+                        entry = float(close[end+2]); sl = float(min(low[end+1], ch_low))-0.05*atr_i
+                        risk = entry - sl
+                        if 0.05 < risk <= 2.5*atr_i:
+                            orders.append(Order(arm,"long","market",entry,sl,entry+2*risk,"MicroMAP",f"{rule}_H2_rr2",{"signal_bar":times[end+2]},60))
+                    break
+                break
+            # bearish spike
+            if all(bear[s0:i+1]) and all(bodies[s0:i+1] > 1.0*atr_i):
+                if any((close[k]-low[k]) > 0.35*bodies[k] for k in range(s0,i+1) if bodies[k]>0):
+                    continue
+                spike_low = float(low[s0:i+1].min()); spike_high = float(high[s0])
+                for end in range(i+3, min(i+10, n-3)):
+                    seg_h, seg_l, seg_b = high[i+1:end+1], low[i+1:end+1], bodies[i+1:end+1]
+                    if not all(seg_l[k] >= seg_l[k-1]-0.05*atr_i for k in range(1,len(seg_l))):
+                        continue
+                    if float(np.mean(seg_b)) > 0.7*float(np.mean(bodies[s0:i+1])):
+                        continue
+                    if seg_h.max() > spike_high + 0.1*atr_i:
+                        continue
+                    ch_low, ch_high = float(seg_l[-1]), float(seg_h.max())
+                    if in_session(times[end]):
+                        arm = bar_end(times[end], bar_min)
+                        entry, sl = ch_low, ch_high + 0.05*atr_i
+                        risk = sl - entry
+                        if 0.05 < risk <= 2.5*atr_i:
+                            orders.append(Order(arm,"short","stop",entry,sl,entry-1.5*risk,"MicroMAP",f"{rule}_H1_rr1.5",{"signal_bar":times[end]},60))
+                    if end+1 < n and ib[end+1] and in_session(times[end+1]):
+                        arm = bar_end(times[end+1], bar_min)
+                        entry, sl = float(low[end+1]), float(high[end+1])+0.05*atr_i
+                        risk = sl - entry
+                        if 0.05 < risk <= 2.5*atr_i:
+                            orders.append(Order(arm,"short","stop",entry,sl,entry-1.5*risk,"MicroMAP",f"{rule}_IB_rr1.5",{"signal_bar":times[end+1]},60))
+                    if end+2 < n and low[end+1] < ch_low and low[end+2] < low[end+1] and in_session(times[end+2]):
+                        arm = bar_end(times[end+2], bar_min)
+                        entry = float(close[end+2]); sl = float(max(high[end+1], ch_high))+0.05*atr_i
+                        risk = sl - entry
+                        if 0.05 < risk <= 2.5*atr_i:
+                            orders.append(Order(arm,"short","market",entry,sl,entry-2*risk,"MicroMAP",f"{rule}_H2_rr2",{"signal_bar":times[end+2]},60))
+                    break
+                break
+
+    orders = dedupe_orders(orders, 30)
+    if use_vol and volma is not None:
+        orders = apply_vol_gate(orders, df["volume"], volma, True, vol_mult, bar_min)
+    return apply_dxy_gate(orders, dxy, use_dxy)
