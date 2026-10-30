@@ -127,11 +127,14 @@ def _find_123flags(
         sl = float(f[1] + 0.1 * atr_v)
         if sl <= entry:
             continue
+        # T = lowest low pivot before P1 (start of T→P3 hook move)
+        prior_lows = [x for x in lows if x[0] < p1[0]]
+        t_px = min((x[1] for x in prior_lows), default=None)
         events.append({
             "side": "short", "conf_i": conf_i, "entry": entry, "sl": sl,
             "p1": p1[1], "p2": p2[1], "p3": p3[1], "f": f[1],
             "pull_ext": pull_ext, "struct_h": struct_h, "atr": atr_v,
-            "f_i": f[0], "f_conf": f[2],
+            "f_i": f[0], "f_conf": f[2], "t_px": t_px,
         })
 
     # LONG setups
@@ -167,11 +170,13 @@ def _find_123flags(
         sl = float(f[1] - 0.1 * atr_v)
         if sl >= entry:
             continue
+        prior_highs = [x for x in highs if x[0] < p1[0]]
+        t_px = max((x[1] for x in prior_highs), default=None)
         events.append({
             "side": "long", "conf_i": conf_i, "entry": entry, "sl": sl,
             "p1": p1[1], "p2": p2[1], "p3": p3[1], "f": f[1],
             "pull_ext": pull_ext, "struct_h": struct_h, "atr": atr_v,
-            "f_i": f[0], "f_conf": f[2],
+            "f_i": f[0], "f_conf": f[2], "t_px": t_px,
         })
     return events
 
@@ -186,7 +191,15 @@ def _tp_price(side: str, entry: float, sl: float, ev: dict, tp_mode: str) -> flo
         d = ev["struct_h"]
         return entry + d if side == "long" else entry - d
     if tp_mode == "nd864":
-        d = 0.864 * ev["struct_h"]
+        # Course: 86.4% of T→Node3 (hook close), NOT 86.4% of struct_h (P1→F).
+        # Fall back to struct_h only if T/node3 missing (mechanical compat).
+        t_px = ev.get("t_px")
+        n3 = ev.get("p3")
+        if t_px is not None and n3 is not None:
+            hook_h = abs(float(n3) - float(t_px))
+            d = 0.864 * hook_h
+        else:
+            d = 0.864 * ev["struct_h"]
         return entry + d if side == "long" else entry - d
     if tp_mode == "nd88":
         d = 0.88 * ev["struct_h"]
@@ -499,9 +512,16 @@ def generate_nds_course(
     bias_series = None
     bias_min = 30
     m30 = resample_ohlc(m1, "30min")
-    if style == "day":
+    # style: day(=M30) | day_H1 | day_H4 | scalp | ctx_M5 | ctx_M15
+    if style in ("day", "day_M30"):
         bias_series = _htf_bias_series(m30, pivot_lr, pivot_lr)
         bias_min = 30
+    elif style == "day_H1":
+        bias_series = _htf_bias_series(resample_ohlc(m1, "1h"), pivot_lr, pivot_lr)
+        bias_min = 60
+    elif style == "day_H4":
+        bias_series = _htf_bias_series(resample_ohlc(m1, "4h"), pivot_lr, pivot_lr)
+        bias_min = 240
     elif style == "ctx_M5":
         bias_series = _htf_bias_series(resample_ohlc(m1, "5min"), pivot_lr, pivot_lr)
         bias_min = 5
@@ -639,8 +659,12 @@ def generate_nds_course(
             continue
         arm = bar_end(ts, bar_m)
         mh = 120 if family == "schematic" else hold_min
+        # Volume gate must check Flag spike bar F (course), not breakout-confirm bar.
+        f_bar_ts = times[ev["f_i"]] if 0 <= ev["f_i"] < n else ts
         base_meta = {
-            "signal_bar": ts, "f": ev["f"], "p3": ev["p3"],
+            "signal_bar": f_bar_ts,  # F bar for vol gate
+            "confirm_bar": ts,
+            "f": ev["f"], "p3": ev["p3"], "t_px": ev.get("t_px"),
             "struct_h": ev["struct_h"], "pull_ext": ev["pull_ext"],
             "family": family, "nd_ratio": ev.get("nd_ratio"),
         }
@@ -725,3 +749,24 @@ def nds_course_signal(
         "arm_time": o.arm_time, "side": o.side, "entry": o.price,
         "sl": o.sl, "tp": o.tp, "variant": o.variant, "meta": o.meta,
     }
+
+
+
+def generate_nds_mechanical(m1, dxy=None, **kwargs):
+    """NDS_Mechanical: fully mechanical 123Flag (current course defaults, struct-based TP)."""
+    kwargs.setdefault("family", "course")
+    kwargs.setdefault("use_partial", False)
+    kwargs.setdefault("use_reentry864", False)
+    return generate_nds_course(m1, dxy, **kwargs)
+
+
+def generate_nds_fidelity(m1, dxy=None, **kwargs):
+    """NDS_Fidelity: closer to course — Hook 86.4 TP, vol on F, optional partial+reentry+HTF N3."""
+    kwargs.setdefault("family", "course")
+    kwargs.setdefault("tp_mode", "nd864")
+    kwargs.setdefault("use_vol", True)
+    kwargs.setdefault("use_partial", True)
+    kwargs.setdefault("use_reentry864", True)
+    kwargs.setdefault("use_htf_n3_tp", True)
+    kwargs.setdefault("style", "day")
+    return generate_nds_course(m1, dxy, **kwargs)

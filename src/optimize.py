@@ -1,10 +1,10 @@
-"""Targeted confirmation filters addressing top loss causes. OOS validation only for claims."""
+"""Targeted confirmation filters. HTF/DXY use last CLOSED bars only (no unfinished bar)."""
 from __future__ import annotations
 from typing import List
 import numpy as np
 import pandas as pd
 from engine import Order
-from indicators import ema, atr, resample_ohlc, in_session
+from indicators import ema, atr, resample_ohlc, in_session, last_closed_value
 
 
 def apply_quality_filters(
@@ -24,11 +24,11 @@ def apply_quality_filters(
     m15 = resample_ohlc(m1, "15min")
     m15["ema50"] = ema(m15["close"], 50)
     m1_atr = atr(m1, 14)
-    dxy_bear = None
+    dxy_close = dxy_ema = None
     if dxy is not None and not dxy.empty:
         d = dxy.copy()
         d["ema50"] = ema(d["close"], 50)
-        dxy_bear = d["close"] < d["ema50"]
+        dxy_close, dxy_ema = d["close"], d["ema50"]
 
     out = []
     for o in orders:
@@ -41,8 +41,8 @@ def apply_quality_filters(
         if not in_session(t) or t.dayofweek >= 5:
             continue
 
-        ai = m1_atr.index.searchsorted(t, side="right") - 1
-        atr_i = float(m1_atr.iloc[ai]) if ai >= 0 else np.nan
+        # ATR: last M1 bar whose close <= t (1-min left-labeled → start <= t-1m)
+        atr_i = last_closed_value(m1_atr, t, 1)
         risk = abs(o.price - o.sl)
         if atr_i and atr_i > 0:
             if risk < min_sl_atr * atr_i:
@@ -51,20 +51,23 @@ def apply_quality_filters(
                 continue
 
         if require_htf:
-            mi = m15.index.searchsorted(t, side="right") - 1
-            if mi < 50:
+            c15 = last_closed_value(m15["close"], t, 15)
+            e15 = last_closed_value(m15["ema50"], t, 15)
+            if c15 is None or e15 is None:
                 continue
-            up = float(m15["close"].iloc[mi]) > float(m15["ema50"].iloc[mi])
+            up = c15 > e15
             if o.side == "long" and not up:
                 continue
             if o.side == "short" and up:
                 continue
 
-        if require_dxy and dxy_bear is not None:
-            di = dxy_bear.index.searchsorted(t, side="right") - 1
-            if di < 0:
+        if require_dxy and dxy_close is not None:
+            # DXY series assumed 15m left-labeled (same as apply_dxy_gate)
+            c = last_closed_value(dxy_close, t, 15)
+            e = last_closed_value(dxy_ema, t, 15)
+            if c is None or e is None:
                 continue
-            bear = bool(dxy_bear.iloc[di])
+            bear = c < e
             if o.side == "long" and not bear:
                 continue
             if o.side == "short" and bear:

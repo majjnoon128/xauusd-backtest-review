@@ -422,3 +422,8 @@ Columns: IS n/R, OOS n/WR/R(expectancy in R)/PF, tpd = OOS trades per day. `OV:`
 | Idris | DROP | strict_uncap | 84 | 0.33 | 0.48 | 1 | ['no_raw_edge_even_gross_uncapped'] |
 
 Full research sources (URLs) for رها batches 1–9 are in the zip under research/.
+
+
+## Post-audit (Oct 30, 2026)
+
+See [`docs/AUDIT_RESPONSE.md`](docs/AUDIT_RESPONSE.md) and [`reports/REBACKTEST_REPORT.md`](reports/REBACKTEST_REPORT.md). Watchdog frozen until rebacktest accepted.
